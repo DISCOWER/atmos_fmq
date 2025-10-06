@@ -80,6 +80,12 @@ class ControlFeeder(Node):
                 partial(self.local_position_callback, namespace=ns),
                 qos_profile
             )
+            self.local_position_subs[ns] = self.create_subscription(
+                VehicleLocalPosition,
+                f'{msg_prefix}/fmu/out/vehicle_local_position_v1',
+                partial(self.local_position_callback, namespace=ns),
+                qos_profile
+            )
 
             self.latest_thrust_setpoints[ns] = VehicleThrustSetpoint()
             self.latest_torque_setpoints[ns] = VehicleTorqueSetpoint()

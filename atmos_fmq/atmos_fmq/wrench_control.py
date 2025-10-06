@@ -29,10 +29,10 @@ def wrap_to_pi(x_):
 class SpacecraftModel():
     def __init__(self):
         self.dt = 0.01
-        self.mass = 16.8
-        self.inertia = 0.1594
-        self.max_force = 1.5
-        self.max_torque = 0.5
+        self.mass = 17.8 #16.8
+        self.inertia = 0.315 #0.1594
+        self.max_force = 3.0
+        self.max_torque = 0.72
 
         # delay model
         self.delay_min = 0.1 # minimum delay in seconds, one-way
@@ -105,6 +105,12 @@ class SpacecraftModel():
         u[0] = np.clip(u[0], -self.max_force, self.max_force)
         u[1] = np.clip(u[1], -self.max_force, self.max_force)
         u[2] = np.clip(u[2], -self.max_torque, self.max_torque)
+
+        #TODO: normalize inputs
+        u[0] /= self.max_force
+        u[1] /= self.max_force
+        u[2] /= self.max_torque
+        # print(f'Control: {u}')
 
         return u
     

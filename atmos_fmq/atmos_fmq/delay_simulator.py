@@ -19,6 +19,7 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDur
 /fmu/out/vehicle_angular_velocity
 /fmu/out/vehicle_attitude
 /fmu/out/vehicle_local_position
+/fmu/out/vehicle_local_position_v1
 /fmu/in/offboard_control_mode
 /fmu/in/vehicle_thrust_setpoint
 /fmu/in/vehicle_torque_setpoint

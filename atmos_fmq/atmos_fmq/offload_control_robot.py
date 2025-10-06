@@ -54,9 +54,11 @@ class MsgHandlerRobot(Node):
         # Send out State
         self.fmq_state_pub = self.create_publisher(RobotState,  f'{self.namespace_prefix}/fmq/state', qos_profile)
         self.local_position_sub = self.create_subscription(VehicleLocalPosition,  f'{self.namespace_prefix}/fmu/out/vehicle_local_position', self.local_position_callback, qos_profile_sub)
+        self.local_position_sub = self.create_subscription(VehicleLocalPosition,  f'{self.namespace_prefix}/fmu/out/vehicle_local_position_v1', self.local_position_callback, qos_profile_sub)
         self.attitude_sub = self.create_subscription(VehicleAttitude,  f'{self.namespace_prefix}/fmu/out/vehicle_attitude', self.attitude_callback, qos_profile_sub)
         self.angular_velocity_sub = self.create_subscription(VehicleAngularVelocity,  f'{self.namespace_prefix}/fmu/out/vehicle_angular_velocity', self.angular_velocity_callback, qos_profile_sub)
         self.status_sub = self.create_subscription(VehicleStatus,  f'{self.namespace_prefix}/fmu/out/vehicle_status', self.status_callback, qos_profile_sub)
+        self.status_sub = self.create_subscription(VehicleStatus,  f'{self.namespace_prefix}/fmu/out/vehicle_status_v1', self.status_callback, qos_profile_sub)
 
         # Handle Controls
         self.fmq_control_sub = self.create_subscription(WrenchControl,  f'{self.namespace_prefix}/fmq/control', self.control_callback, qos_profile)

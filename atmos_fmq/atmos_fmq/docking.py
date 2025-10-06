@@ -15,8 +15,8 @@ from geometry_msgs.msg import PoseStamped, TwistStamped
 DOCKING_ORIENTATION = np.pi*0.0 
 
 def zoh_dyn(x, u, dt):
-    mass = 16.8
-    inertia = 0.1594
+    mass = 17.8
+    inertia = 0.315
     vx = x[2]
     vy = x[3]
     ax = u[0] / mass
@@ -39,7 +39,7 @@ class Docking(Node):
 
         self.docking_target_pose = np.array([-1.33, 1.7968, DOCKING_ORIENTATION]) # x, y, yaw;
         self.docking_target_vel = np.array([0.0, 0.00, 0.0]) # vx, vy, yaw_rate
-        self.parking_pose = np.array([-0.8, 1.7968, DOCKING_ORIENTATION]) # x, y, yaw;
+        self.parking_pose = np.array([-0.2, 1.8, DOCKING_ORIENTATION]) # x, y, yaw;
         # if slower speed needed, set parking x position close to the docking pose
 
         self.pose_pub = self.create_publisher(PoseStamped, f'/{self.namespace}/setpoint_pose', qos_profile)
@@ -47,6 +47,10 @@ class Docking(Node):
         self.control_on_pub = self.create_publisher(Bool, f'/{self.namespace}/control_on', qos_profile)
         self.pose_sub = self.create_subscription(PoseStamped, f'/{self.namespace}/predicted_pose', self.pose_callback, qos_profile)
         self.twist_sub = self.create_subscription(TwistStamped, f'/{self.namespace}/predicted_twist', self.twist_callback, qos_profile)
+
+        #TODO Debug: publish docking target and parking pose /Elias
+        self.docking_target_pub = self.create_publisher(PoseStamped, f'/{self.namespace}/docking_target_pose', qos_profile)
+        self.parking_pose_pub = self.create_publisher(PoseStamped, f'/{self.namespace}/parking_pose', qos_profile)
 
         self.mpc_timer = self.create_timer(1.0, self.compute_traj)
         self.pub_timer = self.create_timer(0.1, self.publish_setpoints)
@@ -60,8 +64,8 @@ class Docking(Node):
         self.traj = None
         self.traj_start_time = None
 
-        self.max_force = 0.5 # 1.5
-        self.max_torque = 0.2 # 0.5
+        self.max_force = 3.0
+        self.max_torque = 0.72
 
         # mpc settings
         self.dt_mpc = 0.5
@@ -139,15 +143,22 @@ class Docking(Node):
         if self.docking_success:
             return
 
+        #TODO Elias: Testing other thresholds
         # do not start solving mpc if too far away from parking pose
-        if np.linalg.norm(self.x_pred[0:3]*np.array([1.0, 5.0, 1.0]) - np.array(self.parking_pose)*np.array([1.0, 5.0, 1.0]))**2 + np.linalg.norm(self.x_pred[4:6])**2 > 0.2**2:
+        # if np.linalg.norm(self.x_pred[0:3]*np.array([1.0, 5.0, 1.0]) - np.array(self.parking_pose)*np.array([1.0, 5.0, 1.0]))**2 + np.linalg.norm(self.x_pred[4:6])**2 > 0.2**2:
+        if not (np.linalg.norm(self.x_pred[0:3] - np.array(self.parking_pose)) < 0.15 and np.linalg.norm(self.x_pred[4:6]) < 0.05):
+            self.get_logger().info(f'val1 = {np.linalg.norm(self.x_pred[0:3] - np.array(self.parking_pose))}, val2 = {np.linalg.norm(self.x_pred[4:6])}')
             return
+        self.get_logger().info('Computing docking trajectory...')
 
         # extract indices 0, 1, 3, 4 from x_pred
         x0 = np.array([self.x_pred[0], self.x_pred[1], self.x_pred[3], self.x_pred[4]])
         self.mpc_solver.set_value(self.X0_param, x0[:4])
 
-        self.mpc_solver.set_initial(self.X, np.tile(x0, (self.N + 1, 1)).T)
+        #TODO Elias: Changing initial state
+        # self.mpc_solver.set_initial(self.X, np.tile(x0, (self.N + 1, 1)).T)
+        x_target = np.array([self.docking_target_pose[0], self.docking_target_pose[1], self.docking_target_vel[0], self.docking_target_vel[1]])
+        self.mpc_solver.set_initial(self.X, np.linspace(x0, x_target, self.N + 1).T)
         self.mpc_solver.set_initial(self.U, np.zeros((2, self.N)))
 
         try:
@@ -156,12 +167,38 @@ class Docking(Node):
             self.traj = x_sol
             self.traj_start_time = self.get_clock().now()
             self.get_logger().info('Found feasible docking trajectory')
-        except RuntimeError as e:
+        except Exception as e:
             # infeasible
+            self.get_logger().info('No feasible docking trajectory found')
+            self.get_logger().info(str(e))
             self.traj = None
 
 
     def publish_setpoints(self):
+        #TODO Elias: Publishing docking target and parking pose for debugging with plotjuggler
+        docking_target_msg = PoseStamped()
+        docking_target_msg.header.stamp = self.get_clock().now().to_msg()
+        docking_target_msg.header.frame_id = 'world'
+        docking_target_msg.pose.position.x = self.docking_target_pose[0]
+        docking_target_msg.pose.position.y = self.docking_target_pose[1]
+        docking_target_msg.pose.position.z = 0.0
+        docking_target_msg.pose.orientation.w = np.cos(self.docking_target_pose[2] / 2)
+        docking_target_msg.pose.orientation.x = 0.0
+        docking_target_msg.pose.orientation.y = 0.0
+        docking_target_msg.pose.orientation.z = np.sin(self.docking_target_pose[2] / 2)
+        self.docking_target_pub.publish(docking_target_msg)
+        parking_msg = PoseStamped()
+        parking_msg.header.stamp = self.get_clock().now().to_msg()
+        parking_msg.header.frame_id = 'world'
+        parking_msg.pose.position.x = self.parking_pose[0]
+        parking_msg.pose.position.y = self.parking_pose[1]
+        parking_msg.pose.position.z = 0.0
+        parking_msg.pose.orientation.w = np.cos(self.parking_pose[2] / 2)
+        parking_msg.pose.orientation.x = 0.0
+        parking_msg.pose.orientation.y = 0.0
+        parking_msg.pose.orientation.z = np.sin(self.parking_pose[2] / 2)
+        self.parking_pose_pub.publish(parking_msg)
+
         pose_msg = PoseStamped()
         pose_msg.header.stamp = self.get_clock().now().to_msg()
         pose_msg.header.frame_id = 'world'
