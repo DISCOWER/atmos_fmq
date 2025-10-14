@@ -53,7 +53,7 @@ def generate_launch_description():
             package='atmos_fmq',
             namespace='',
             executable='docking',
-            name='docking',
+            name='docking_setpoint_planner',
             output='screen',
             emulate_tty=True,
             parameters=[

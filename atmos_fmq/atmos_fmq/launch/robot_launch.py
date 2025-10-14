@@ -47,8 +47,8 @@ def generate_launch_description():
         description='Path to the Docker Compose file for the vehicle'
     )
 
-    mode    = LaunchConfiguration('mode')
-    namespace = LaunchConfiguration('namespace')
+    mode                = LaunchConfiguration('mode')
+    namespace           = LaunchConfiguration('namespace')
     docker_compose_path = LaunchConfiguration('docker_compose_path')
 
     # Clean namespace string to remove leading/trailing slashes

@@ -28,7 +28,7 @@ def generate_launch_description():
             package='atmos_fmq',
             namespace='',
             executable='robot',
-            name='control_feeder',
+            name='remote_to_fmu_bridge',
             output='screen',
             emulate_tty=True,
             parameters=[

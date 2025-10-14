@@ -14,20 +14,29 @@ from functools import partial
 
 class ControlFeeder(Node):
     def __init__(self):
+        """
+        This node acts as a bridge between the remote operators and the robot.
+        The remote operator sends control inputs via the /ns/fmq/control_topic,
+        and this node does :
+            1. Publishes the control inputs to the onboard PX4 controller topics.
+            2. Subscribes to the PX4 state topics and republishes them to the /fmq/state as a feedback to the remote operator.
+        """
+
         super().__init__('control_feeder')
 
-        qos_profile = QoSProfile(
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=10,
+        qos_profile      = QoSProfile(
+            reliability  = QoSReliabilityPolicy.BEST_EFFORT,
+            history      = QoSHistoryPolicy.KEEP_LAST,
+            depth        = 10,
         )
 
         # Timers
-        self.pub_to_robot_timer = self.create_timer(0.1, self.publish_to_robots)
-        self.pub_to_ctrl_timer = self.create_timer(0.1, self.publish_to_ctrler)
+        rate = 10.0 # Hz
+        self.pub_to_robot_timer = self.create_timer(1.0 / rate, self.publish_to_robots)
+        self.pub_to_ctrl_timer  = self.create_timer(1.0 / rate, self.publish_to_controller)
 
         # FleetMQ messages pub/sub
-        self.state_pub = self.create_publisher(MultiDelayRobotState, '/pop/fmq/state', qos_profile)
+        self.state_pub   = self.create_publisher(MultiDelayRobotState, '/pop/fmq/state', qos_profile)
         self.control_sub = self.create_subscription(MultiDelayWrenchControl, '/pop/fmq/control', self.control_callback, qos_profile)
 
         # Get namespace names
@@ -38,48 +47,71 @@ class ControlFeeder(Node):
         self.torque_setpoint_pubs: dict[str, Publisher] = {}
         self.offboard_control_mode_pubs: dict[str, Publisher] = {}
 
-        self.angular_velocity_subs: dict[str, Subscription] = {}
-        self.attitude_subs: dict[str, Subscription] = {}
-        self.local_position_subs: dict[str, Subscription] = {}
+        self.angular_velocity_subs: dict[str, list[Subscription]] = {}
+        self.attitude_subs        : dict[str, list[Subscription]] = {}
+        self.local_position_subs  : dict[str, list[Subscription]] = {}
+ 
+        self.latest_thrust_setpoints       : dict[str, VehicleThrustSetpoint] = {}
+        self.latest_torque_setpoints       : dict[str, VehicleTorqueSetpoint] = {}
+        self.latest_offboard_control_modes : dict[str, OffboardControlMode] = {}
+        self.latest_control_ids            : dict[str, int] = {}
+        self.rec_times                     : dict[str, list[int, Time, Duration]] = {}
+        self.control_arrival_times         : dict[str, Time] = {}
 
-        self.latest_thrust_setpoints: dict[str, VehicleThrustSetpoint] = {}
-        self.latest_torque_setpoints: dict[str, VehicleTorqueSetpoint] = {}
-        self.latest_offboard_control_modes: dict[str, OffboardControlMode] = {}
-        self.latest_control_ids: dict[str, int] = {}
-        self.rec_times: dict[str, list[int, Time, Duration]] = {}
-        self.control_arrival_times: dict[str, Time] = {}
+        self.control_on                     : dict[str, bool] = {}
+        self.angular_velocity_on            : dict[str, bool] = {}
+        self.attitude_on                    : dict[str, bool] = {}
+        self.local_position_on              : dict[str, bool] = {}
 
-        self.control_on: dict[str, bool] = {}
-        self.angular_velocity_on: dict[str, bool] = {}
-        self.attitude_on: dict[str, bool] = {}
-        self.local_position_on: dict[str, bool] = {}
+        self.delay_robot_state_msgs         : dict[str, DelayRobotState] = {}
 
-        self.delay_robot_state_msgs: dict[str, DelayRobotState] = {}
-        
         for ns in self.namespaces:
             msg_prefix = '' if ns == '' else f'/{ns}'
-            self.thrust_setpoint_pubs[ns] = self.create_publisher(VehicleThrustSetpoint, f'{msg_prefix}/fmu/in/vehicle_thrust_setpoint', qos_profile)
-            self.torque_setpoint_pubs[ns] = self.create_publisher(VehicleTorqueSetpoint, f'{msg_prefix}/fmu/in/vehicle_torque_setpoint', qos_profile)
+            self.thrust_setpoint_pubs[ns]       = self.create_publisher(VehicleThrustSetpoint, f'{msg_prefix}/fmu/in/vehicle_thrust_setpoint', qos_profile)
+            self.torque_setpoint_pubs[ns]       = self.create_publisher(VehicleTorqueSetpoint, f'{msg_prefix}/fmu/in/vehicle_torque_setpoint', qos_profile)
             self.offboard_control_mode_pubs[ns] = self.create_publisher(OffboardControlMode, f'{msg_prefix}/fmu/in/offboard_control_mode', qos_profile)
 
-            self.angular_velocity_subs[ns] = self.create_subscription(
+            self.angular_velocity_subs[ns] = [self.create_subscription(
                 VehicleAngularVelocity,
                 f'{msg_prefix}/fmu/out/vehicle_angular_velocity',
                 partial(self.angular_velocity_callback, namespace=ns),
                 qos_profile
-            )
-            self.attitude_subs[ns] = self.create_subscription(
+            )]
+            self.angular_velocity_subs[ns] += [self.create_subscription(
+                VehicleAngularVelocity,
+                f'{msg_prefix}/fmu/out/vehicle_angular_velocity_v1',
+                partial(self.angular_velocity_callback, namespace=ns),
+                qos_profile
+            )]
+
+
+
+
+            self.attitude_subs[ns] = [self.create_subscription(
                 VehicleAttitude,
                 f'{msg_prefix}/fmu/out/vehicle_attitude',
                 partial(self.attitude_callback, namespace=ns),
                 qos_profile
-            )
-            self.local_position_subs[ns] = self.create_subscription(
+            )]
+            self.attitude_subs[ns] += [self.create_subscription(
+                VehicleAttitude,
+                f'{msg_prefix}/fmu/out/vehicle_attitude_v1',
+                partial(self.attitude_callback, namespace=ns),
+                qos_profile
+            )]
+
+            self.local_position_subs[ns] = [self.create_subscription(
                 VehicleLocalPosition,
                 f'{msg_prefix}/fmu/out/vehicle_local_position',
                 partial(self.local_position_callback, namespace=ns),
                 qos_profile
-            )
+            )]
+            self.local_position_subs[ns] += [self.create_subscription(
+                VehicleLocalPosition,
+                f'{msg_prefix}/fmu/out/vehicle_local_position_v1',
+                partial(self.local_position_callback, namespace=ns),
+                qos_profile
+            )]
 
             self.latest_thrust_setpoints[ns] = VehicleThrustSetpoint()
             self.latest_torque_setpoints[ns] = VehicleTorqueSetpoint()
@@ -107,7 +139,7 @@ class ControlFeeder(Node):
                 self.torque_setpoint_pubs[ns].publish(self.latest_torque_setpoints[ns])
                 self.offboard_control_mode_pubs[ns].publish(self.latest_offboard_control_modes[ns])
 
-    def publish_to_ctrler(self):
+    def publish_to_controller(self):
         msg = MultiDelayRobotState()
         msg.robot_states = []
         for ns in self.namespaces:
@@ -118,6 +150,10 @@ class ControlFeeder(Node):
                 self.delay_robot_state_msgs[ns].sec_since_latest_ctrl = (cur_time - self.control_arrival_times[ns]).nanoseconds / 1e9
                 self.delay_robot_state_msgs[ns].transmission_delays = [dur.to_msg() for _, _, dur in self.rec_times[ns]]
                 msg.robot_states.append(deepcopy(self.delay_robot_state_msgs[ns]))
+        
+        if len(msg.robot_states) == 0:
+            self.get_logger().warn(f'No robots in the list of namespace {self.namespaces} has no available states to publish. Make sure all required topics are being published from the vehicle.')
+            self.get_logger().warn(f'Control on: {self.control_on}, Angular velocity on: {self.angular_velocity_on}, Attitude on: {self.attitude_on}, Local position on: {self.local_position_on}')
         self.state_pub.publish(msg)
 
     def control_callback(self, msg: MultiDelayWrenchControl):

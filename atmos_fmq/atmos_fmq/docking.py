@@ -13,18 +13,111 @@ from std_msgs.msg import Bool
 from geometry_msgs.msg import PoseStamped, TwistStamped
 
 DOCKING_ORIENTATION = np.pi*0.0 
+DOCKING_VELOCITY    = 0. 
+
+X     = 0
+Y     = 1
+VX    = 2
+VY    = 3
+
+FX   = 0
+FY   = 1
 
 def zoh_dyn(x, u, dt):
-    mass = 16.8
+    """
+    Zero-order hold dynamics for 2D translation with acceleration inputs.
+    State: [x, y, vx, vy]
+    Input: [fx, fy] (forces)
+    Exact integration for double integrator
+    """
+    
+    mass    = 16.8
     inertia = 0.1594
-    vx = x[2]
-    vy = x[3]
-    ax = u[0] / mass
-    ay = u[1] / mass
-    return x + dt * ca.vcat([vx + 0.5 * dt * ax, vy + 0.5 * dt * ay, ax, ay])
+    vx = x[VX]
+    vy = x[VY]
+    ax = u[FX] / mass
+    ay = u[FY] / mass
+
+    x_next  = vx*dt + 0.5 * dt**2 * ax + x[X]
+    y_next  = vy*dt + 0.5 * dt**2 * ay + x[Y]
+    vx_next = ax * dt + x[VX]
+    vy_next = ay * dt + x[VY]
+
+    return ca.vcat([x_next, y_next, vx_next, vy_next])
+
+
+class MPCPlanner:
+    def __init__(self, max_force : float, N, dt_mpc : float):
+        
+        ############################################
+        # Setup MPC solver (Here it is a Double integrator with 4 states)
+        ############################################
+        
+        # define indices of the last 5 seconds
+        _5s = int(5.0 / dt_mpc)
+        self.umin = np.tile([-max_force, -max_force], (N, 1)).T # size (2, N)
+        self.umax = np.tile([max_force, max_force], (N, 1)).T   # size (2, N)
+
+        # Constrain input in a funnel set that shrinks to zero in the last 5 seconds
+        self.umin[:,-_5s:] = self.umin[:,-_5s:] * np.linspace(1, 0.01, _5s)
+        self.umax[:,-_5s:] = self.umax[:,-_5s:] * np.linspace(1, 0.01, _5s)
+
+        # Cost weights (increases over the horizon)
+        ramp       = np.linspace(1.0, 2.0, N)
+        self.R_seq = [np.diag([1.0, 1.0]) * r**2 for r in ramp]
+        
+        # define MPC solver variables
+        self.mpc_solver = ca.Opti("conic")
+        self.X          = self.mpc_solver.variable(4, N + 1) # x, y, vx, vy
+        self.U          = self.mpc_solver.variable(2, N)     # ax, ay
+        self.X0_param   = self.mpc_solver.parameter(4)
+        self.XF_param   = self.mpc_solver.parameter(4)
+        
+        # define MPC solver constraints
+        self.mpc_solver.subject_to(self.X[:, 0]  == self.X0_param)
+        self.mpc_solver.subject_to(self.X[:, -1] == self.XF_param)
+
+        for k in range(N):
+            x_next = zoh_dyn(self.X[:, k], self.U[:, k], dt_mpc)
+            self.mpc_solver.subject_to(self.X[:, k + 1] == x_next)      # dynamic constraint
+            self.mpc_solver.subject_to(self.U[:, k] >= self.umin[:, k]) # input constraint
+            self.mpc_solver.subject_to(self.U[:, k] <= self.umax[:, k]) # input constraint
+
+        # Cost: sum u^T R_k u (only input)
+        self.J = 0
+        for k in range(N):
+            uk     = self.U[:, k]
+            Rk     = self.R_seq[k]
+            stage  = ca.mtimes([uk.T, Rk, uk])
+            self.J = self.J + stage * dt_mpc
+
+        self.mpc_solver.minimize(self.J)
+        self.mpc_solver.solver("osqp") # "osqp", "daqp", "qpoases"
+        # get MPC as function for performance 
+        self.mpc_function = self.mpc_solver.to_function("mpc_solver", [self.X0_param, self.XF_param], [self.U, self.X], ["x0", "xf"], ["u_opt", "x_opt"])
+
+    def solve(self, x0 : np.ndarray, xf : np.ndarray):
+
+        u_opt, x_opt = self.mpc_function(x0, xf)
+        return u_opt.full(), x_opt.full()
+   
+
 
 class Docking(Node):
     def __init__(self):
+        """ 
+        Node to compute and publish docking setpoints. 
+
+        The first set point provided is a "parking" pose in front of the docking station,
+        then when close enough to the parking pose, an MPC is solved to dock the vehicle.
+        The MPC uses a simple 2D double integrator model with force inputs, and tries
+        to reach the docking pose with zero velocity. The MPC has a time-varying input
+        constraint that linearly decays to zero in the last 5 seconds of the horizon.
+        The cost is only on the input, with a time-varying weight that increases over
+        the horizon to reduce magnitude of the input over the horizon.
+        """
+
+
         super().__init__('docking_setpoints')
 
         qos_profile = QoSProfile(
@@ -37,89 +130,52 @@ class Docking(Node):
         self.namespace = self.declare_parameter('namespace', '').value
         self.namespace = 'pop'
 
-        self.docking_target_pose = np.array([-1.33, 1.7968, DOCKING_ORIENTATION]) # x, y, yaw;
-        self.docking_target_vel = np.array([0.0, 0.00, 0.0]) # vx, vy, yaw_rate
-        self.parking_pose = np.array([-0.8, 1.7968, DOCKING_ORIENTATION]) # x, y, yaw;
+        self.docking_target_pose = np.array([-1.33, 1.7968, DOCKING_ORIENTATION]) # x, y, yaw;       (pose to be reached at the end of the docking maneuver)
+        self.docking_target_vel  = np.array([0.0, 0.00    , DOCKING_VELOCITY])    # vx, vy, yaw_rate (velocity to be reached at the end of the docking maneuver)
+        self.parking_pose        = np.array([-0.8, 1.7968 , DOCKING_ORIENTATION]) # x, y, yaw;       (pose to be reached before the frontal docking starts)
+        self.parking_vel         = np.array([0.0, 0.0     , 0.0])                 # vx, vy, yaw_rate (velocity to be reached before the frontal docking starts)
         # if slower speed needed, set parking x position close to the docking pose
 
-        self.pose_pub = self.create_publisher(PoseStamped, f'/{self.namespace}/setpoint_pose', qos_profile)
-        self.twist_pub = self.create_publisher(TwistStamped, f'/{self.namespace}/setpoint_twist', qos_profile)
-        self.control_on_pub = self.create_publisher(Bool, f'/{self.namespace}/control_on', qos_profile)
-        self.pose_sub = self.create_subscription(PoseStamped, f'/{self.namespace}/predicted_pose', self.pose_callback, qos_profile)
-        self.twist_sub = self.create_subscription(TwistStamped, f'/{self.namespace}/predicted_twist', self.twist_callback, qos_profile)
+        self.pose_pub       = self.create_publisher(PoseStamped    , f'/{self.namespace}/setpoint_pose', qos_profile)
+        self.twist_pub      = self.create_publisher(TwistStamped   , f'/{self.namespace}/setpoint_twist', qos_profile)
+        self.control_on_pub = self.create_publisher(Bool           , f'/{self.namespace}/control_on', qos_profile)
+
+        self.pose_sub       = self.create_subscription(PoseStamped , f'/{self.namespace}/predicted_pose', self.pose_callback, qos_profile)
+        self.twist_sub      = self.create_subscription(TwistStamped, f'/{self.namespace}/predicted_twist', self.twist_callback, qos_profile)
 
         self.mpc_timer = self.create_timer(1.0, self.compute_traj)
         self.pub_timer = self.create_timer(0.1, self.publish_setpoints)
 
-        self.x_pred = np.zeros(6) # x, y, yaw, vx, vy, yaw_rate
+        self.x_pred = np.zeros(6) # x, y, yaw, vx, vy, yaw_rate (full state)
 
-        self.has_pose = False
-        self.has_twist = False
+        self.has_pose  = False   # Flag to mark the correct acquisition of the pose
+        self.has_twist = False   # Flag to mark the correct acquisition of the twist
 
         self.docking_success = False
-        self.traj = None
+        self.traj            = None
         self.traj_start_time = None
 
-        self.max_force = 0.5 # 1.5
+        self.max_force  = 0.5 # 1.5
         self.max_torque = 0.2 # 0.5
-
-        # mpc settings
-        self.dt_mpc = 0.5
-        self.N = 20
-        self.horizon = self.dt_mpc * self.N
-
-        _5s = int(5.0 / self.dt_mpc)
-        self.umin = np.tile([-self.max_force, -self.max_force], (self.N, 1))
-        self.umax = np.tile([self.max_force, self.max_force], (self.N, 1))
-
-        # Input scale not decaying
-        self.umin[-_5s:, :] = self.umin[-_5s:, :] * np.linspace(1, 0, _5s).reshape(-1, 1) ** 1
-        self.umax[-_5s:, :] = self.umax[-_5s:, :] * np.linspace(1, 0, _5s).reshape(-1, 1) ** 1
-
-        # cost weights
-        self.R_seq = np.tile(np.diag([1.0, 1.0]), (self.N, 1, 1))
-        ramp = np.linspace(1.0, 2.0, self.N).reshape(-1, 1, 1) ** 2
-        self.R_seq = self.R_seq * ramp
-
-        self.mpc_solver = ca.Opti()
-        self.X = self.mpc_solver.variable(4, self.N + 1) # x, y, vx, vy
-        self.U = self.mpc_solver.variable(2, self.N)     # ax, ay
-        self.X0_param = self.mpc_solver.parameter(4)
         
-        self.mpc_solver.subject_to(self.X[:, 0] == self.X0_param)
-        self.mpc_solver.subject_to(self.X[:, -1] == ca.vcat([self.docking_target_pose[0], self.docking_target_pose[1], self.docking_target_vel[0], self.docking_target_vel[1]]))
-        for k in range(self.N):
-            x_next = zoh_dyn(self.X[:, k], self.U[:, k], self.dt_mpc)
-            self.mpc_solver.subject_to(self.X[:, k + 1] == x_next)
-            self.mpc_solver.subject_to(self.umin[k, :] <= self.U[:, k])
-            self.mpc_solver.subject_to(self.U[:, k] <= self.umax[k, :])
-
-        # Cost: sum u^T R_k u (only input)
-        self.J = 0
-        for k in range(self.N):
-            uk = self.U[:, k]
-            Rk = ca.DM(self.R_seq[k])
-            stage = ca.mtimes([uk.T, Rk, uk])
-            self.J = self.J + stage * self.dt_mpc
-        self.mpc_solver.minimize(self.J)
-
-        # solver options
-        self.ipopt_options = {
-            "print_level": 0, "max_iter": 2000, "tol": 1e-8,
-            "dual_inf_tol": 1e-8, "constr_viol_tol": 1e-8,
-            "compl_inf_tol": 1e-8, "acceptable_tol": 1e-6,
-        }
-        self.mpc_solver.solver("ipopt", {"print_time": False}, self.ipopt_options)
+        ############################################
+        # Setup MPC solver (Here it is a Double integrator with 4 states)
+        ############################################
+        
+        self.dt_mpc       = 0.5
+        self.N            = 40
+        self.horizon      = self.dt_mpc * self.N
+        self.mpc_planner  = MPCPlanner(self.max_force, self.N, self.dt_mpc)
 
     def pose_callback(self, msg: PoseStamped):
-        self.has_pose = True
+        self.has_pose  = True
         self.x_pred[0] = msg.pose.position.x
         self.x_pred[1] = msg.pose.position.y
 
         # yaw from quaternion
-        q = msg.pose.orientation
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        q              = msg.pose.orientation
+        siny_cosp      = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp      = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.x_pred[2] = np.arctan2(siny_cosp, cosy_cosp)
 
     def twist_callback(self, msg: TwistStamped):
@@ -130,38 +186,49 @@ class Docking(Node):
 
     def compute_traj(self):
         if not (self.has_pose and self.has_twist):
+            self.get_logger().info('Waiting for pose and twist from the wrench controller...')
             self.traj = None
             return
 
-        if self.traj is not None:
+        if self.traj is not None: # If the trajectory was already computed then no need to recompute
+            self.get_logger().info('Following computed trajectory...')
             return
     
         if self.docking_success:
+            self.get_logger().info('Successfully docked, no more trajectory computation!')
             return
 
         # do not start solving mpc if too far away from parking pose
-        if np.linalg.norm(self.x_pred[0:3]*np.array([1.0, 5.0, 1.0]) - np.array(self.parking_pose)*np.array([1.0, 5.0, 1.0]))**2 + np.linalg.norm(self.x_pred[4:6])**2 > 0.2**2:
+        pos_tolerance  = 0.2
+        vel_tolerance  = 0.2
+        predicted_pose = self.x_pred[0:3]
+        predicted_vel  = self.x_pred[3:6]
+        
+        if np.linalg.norm(predicted_pose - self.parking_pose) > pos_tolerance or np.linalg.norm(predicted_vel - self.parking_vel) > vel_tolerance:
+            self.get_logger().info('going toward parking pose first... current error to parking pose: position %.2f m' % np.linalg.norm(predicted_pose - self.parking_pose) + ' velocity %.2f m/s' % np.linalg.norm(predicted_vel - self.parking_vel))
             return
 
-        # extract indices 0, 1, 3, 4 from x_pred
-        x0 = np.array([self.x_pred[0], self.x_pred[1], self.x_pred[3], self.x_pred[4]])
-        self.mpc_solver.set_value(self.X0_param, x0[:4])
-
-        self.mpc_solver.set_initial(self.X, np.tile(x0, (self.N + 1, 1)).T)
-        self.mpc_solver.set_initial(self.U, np.zeros((2, self.N)))
-
+        # extract indices 0, 1, 3, 4 from x_pred (x,y,vx,vy)
+        x0_mpc = np.array([self.x_pred[0], self.x_pred[1], self.x_pred[3], self.x_pred[4]])
+        xf_mpc = np.array([self.docking_target_pose[0], self.docking_target_pose[1], self.docking_target_vel[0], self.docking_target_vel[1]])
+        
         try:
-            sol = self.mpc_solver.solve()
-            x_sol = sol.value(self.X).T
-            self.traj = x_sol
+            u_trj,x_trj = self.mpc_planner.solve(x0_mpc, xf_mpc)
+            self.traj = x_trj.T
             self.traj_start_time = self.get_clock().now()
             self.get_logger().info('Found feasible docking trajectory')
+
         except RuntimeError as e:
-            # infeasible
-            self.traj = None
+            self.get_logger().error('MPC planning failed. The following error was returned: %s' % e)
+            return
 
 
     def publish_setpoints(self):
+        """
+        Set point publisher.  
+        Publishes parking pose if no trajectory, or interpolated
+        trajectory if available. If docking
+        """
         pose_msg = PoseStamped()
         pose_msg.header.stamp = self.get_clock().now().to_msg()
         pose_msg.header.frame_id = 'world'

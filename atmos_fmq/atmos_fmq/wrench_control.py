@@ -15,6 +15,17 @@ from px4_msgs.msg import OffboardControlMode, VehicleThrustSetpoint, VehicleTorq
 import random
 from functools import partial
 
+X     = 0
+Y     = 1
+THETA = 2
+VX    = 3
+VY    = 4
+OMEGA = 5
+
+FX   = 0
+FY   = 1
+ALPHA= 2
+
 def wrap_to_pi(x_):
     x = x_
     while True:
@@ -28,10 +39,27 @@ def wrap_to_pi(x_):
 
 class SpacecraftModel():
     def __init__(self):
-        self.dt = 0.01
-        self.mass = 16.8
-        self.inertia = 0.1594
-        self.max_force = 1.5
+
+        """
+        Simple 2D spacecraft model with position, heading, linear velocity, angular velocity states
+        State vector: [x, y, theta, vx, vy, omega]
+        Control inputs: [Fx, Fy, alpha] (force in x, force in y, angular acceleration)
+        
+        Dynamics:
+            dx/dt = vx
+            dy/dt = vy
+            dtheta/dt = omega
+            dvx/dt = Fx/mass
+            dvy/dt = Fy/mass
+            domega/dt = alpha/inertia
+        """
+
+
+        # model parameters
+        self.dt         = 0.01
+        self.mass       = 16.8
+        self.inertia    = 0.1594
+        self.max_force  = 1.5
         self.max_torque = 0.5
 
         # delay model
@@ -48,17 +76,21 @@ class SpacecraftModel():
                 [0.0000,   -0.0000,    0.1008,    0.0000,   -0.0000,    0.1751]])
 
     def f(self, x):
-        return np.array([x[3], x[4], x[5], 0.0, 0.0, 0.0])
+        return np.array([x[VX], 
+                         x[VY], 
+                         x[OMEGA], 
+                         0.0, 
+                         0.0, 
+                         0.0])
 
     def g(self, x):
         return np.array([
             [0.0, 0.0, 0.0],
             [0.0, 0.0, 0.0],
             [0.0, 0.0, 0.0],
-            [np.cos(x[2]) / self.mass, -np.sin(x[2]) / self.mass, 0.0],
-            [np.sin(x[2]) / self.mass, np.cos(x[2]) / self.mass, 0.0],
-            [0.0, 0.0, 1.0 / self.inertia]
-        ])
+            [np.cos(x[THETA]) / self.mass, -np.sin(x[THETA]) / self.mass, 0.0               ],
+            [np.sin(x[THETA]) / self.mass,  np.cos(x[THETA]) / self.mass, 0.0               ],
+            [0.0                     ,                               0.0, 1.0 / self.inertia]])
 
     # inputs should be a list of (input, duration) tuples
     def predict(self, inputs, x0):
@@ -76,62 +108,73 @@ class SpacecraftModel():
     def lyapunov(self, x, x0):
         # Lyapunov function: V(x) = 0.5 * ((x - x0)^T * P * (x - x0))
         # where P is a positive definite matrix
-        # solve LQR in matlab to obtain P
-        dx = x - x0
-        dx[2] = np.sin(wrap_to_pi(dx[2]) / 2) * 2
-        grad = np.dot(self.P, dx)
-        grad[2] *= np.cos(dx[2] / 2)
-        return 0.5 * np.dot(dx, np.dot(self.P, dx)), grad
+        # solve LQR in matlab to obtain P. 
+        # The angular difference is treated in term of the chord length spanned
+        # on the unit circle by the angle difference. This is to convert the angular distance into a 
+        # vector space where the LQR is defined. chord = 2 * sin(dtheta/2)
+
+        dx           = x - x0
+        dtheta       = wrap_to_pi(dx[THETA])      # store the true angle difference
+        dx[THETA]    = 2 * np.sin(dtheta / 2)     # transformed angular deviation
+        grad         = np.dot(self.P, dx)         # P * f(x)
+        grad[THETA] *= np.cos(dtheta / 2)         # multiply by cos(Δθ/2)
+        V            = 0.5 * np.dot(dx, np.dot(self.P, dx))
+        
+        return V, grad
 
     def control(self, x, x0):
         ##### 250924: xy pd gain tune
-        kx = 1.0 # 0.47
-        kxdot = 4.02
-        ky = 1.0 # 0.47
-        kydot = 4.02
-        ktheta = 0.2 # 0.08
-        kw = 0.3 # 0.13
-        dx = x - x0
-        dx[2] = wrap_to_pi(dx[2])
-        vxdot_des = -kx * dx[0] - kxdot * dx[3]
-        vydot_des = -ky * dx[1] - kydot * dx[4]
-        alpha_des = -ktheta * dx[2] - kw * dx[5]
+        kx      = 1.0 # 0.47
+        kxdot   = 4.02
+        ky      = 1.0 # 0.47
+        kydot   = 4.02
+        ktheta  = 0.2 # 0.08
+        kw      = 0.3 # 0.13
+        dx      = x - x0
+
+        dx[THETA] = wrap_to_pi(dx[THETA])
+        vxdot_des = -kx * dx[X]         - kxdot * dx[VX]
+        vydot_des = -ky * dx[Y]         - kydot * dx[VY]
+        alpha_des = -ktheta * dx[THETA] - kw * dx[OMEGA]
 
         u = np.zeros(3)
-        u[0] = vxdot_des * np.cos(x[2]) + vydot_des * np.sin(x[2])
-        u[1] = -vxdot_des * np.sin(x[2]) + vydot_des * np.cos(x[2])
-        u[2] = alpha_des
+        u[FX]    = vxdot_des * np.cos(x[2]) + vydot_des * np.sin(x[2])
+        u[FY]    = -vxdot_des * np.sin(x[2]) + vydot_des * np.cos(x[2])
+        u[ALPHA] = alpha_des
 
-        u[0] = np.clip(u[0], -self.max_force, self.max_force)
-        u[1] = np.clip(u[1], -self.max_force, self.max_force)
-        u[2] = np.clip(u[2], -self.max_torque, self.max_torque)
+        u[FX]    = np.clip(u[FX], -self.max_force, self.max_force)
+        u[FY]    = np.clip(u[FY], -self.max_force, self.max_force)
+        u[ALPHA] = np.clip(u[ALPHA], -self.max_torque, self.max_torque)
 
         return u
     
 class ControllerInstance():
     def __init__(self, ns: str='', x=np.zeros(6), ctrl_dt=0.1):
-        self.ns = ns
-        self.x0 = x.copy() # desired state, set to initial state at start
-        self.x0[2] = wrap_to_pi(self.x0[2])
-        self.x = x.copy() # state from the robot
-        self.x[2] = wrap_to_pi(self.x[2])
-        self.last_msg = None
-        self.model = SpacecraftModel()
+        
+        
+        self.ns        = ns
+        self.x0        = x.copy() # desired state, set to initial state at start
+        self.x0[THETA] = wrap_to_pi(self.x0[THETA])
+        self.x         = x.copy() # state from the robot
+        self.x[THETA]  = wrap_to_pi(self.x[THETA])
+        self.last_msg  = None
+        self.model     = SpacecraftModel()
+
+
         self.last_setpoint_stamp = None
-        self.ctrl_id = 0
-        self.pending_inputs = []  # list of (id, time, input) tuples
-        self.delay_history = []
-        self.ctrl_dt = ctrl_dt
+        self.ctrl_id             = 0
+        self.pending_inputs      = []  # list of (id, time, input) tuples
+        self.delay_history       = []
+        self.ctrl_dt             = ctrl_dt
     
     def handle_state_msg(self, msg: DelayRobotState):
         self.last_msg = msg
-        self.x[0] = msg.vehicle_local_position.x
-        self.x[1] = msg.vehicle_local_position.y
-        # self.x[2] = 2.0 * np.arctan2(-msg.vehicle_attitude.q[3], -msg.vehicle_attitude.q[0])
-        self.x[2] = msg.vehicle_local_position.heading
-        self.x[3] = msg.vehicle_local_position.vx
-        self.x[4] = msg.vehicle_local_position.vy
-        self.x[5] = msg.vehicle_angular_velocity.xyz[2]
+        self.x[X]     = msg.vehicle_local_position.x
+        self.x[Y]     = msg.vehicle_local_position.y
+        self.x[THETA] = msg.vehicle_local_position.heading # if quaternion: 2.0 * np.arctan2(-msg.vehicle_attitude.q[3], -msg.vehicle_attitude.q[0])
+        self.x[VX]    = msg.vehicle_local_position.vx
+        self.x[VY]    = msg.vehicle_local_position.vy
+        self.x[OMEGA] = msg.vehicle_angular_velocity.xyz[2]
 
         while len(self.pending_inputs) > 0 and self.pending_inputs[0][0] < msg.latest_ctrl_id:
             self.pending_inputs.pop(0)
@@ -142,17 +185,24 @@ class ControllerInstance():
                 self.delay_history.pop(0)
 
     def generate_control(self, stamp: Time, control_on: bool ) -> tuple[DelayWrenchControl, PoseStamped, TwistStamped]:
-        # do prediction here
+        """
+        Generate control message based on the current state and desired state.
+        Uses a simple PD controller for position and velocity control.
+        1. Predict the state after the delay using the pending inputs.
+        2. Compute the control input using the predicted state and desired state.
+        3. Package the control input into a DelayWrenchControl message.
+        """
         x_for_control = np.zeros(6)
+        
         if self.last_msg is None:
             u = np.zeros(3)
+        
         else:
             # do prediction
             worst_lyap_val = -np.inf
-            Aineq = [
-            ]
-            bineq = [
-            ]
+            Aineq          = []
+            bineq          = []
+
             # print(self.ns, self.x0, self.x)
             n_preds = 10
             for _ in range(n_preds):
@@ -219,23 +269,23 @@ class ControllerInstance():
         pose_pred_msg = PoseStamped()
         pose_pred_msg.header.stamp = stamp.to_msg()
         pose_pred_msg.header.frame_id = 'world'
-        pose_pred_msg.pose.position.x = x_for_control[0]
-        pose_pred_msg.pose.position.y = x_for_control[1]
+        pose_pred_msg.pose.position.x = x_for_control[X]
+        pose_pred_msg.pose.position.y = x_for_control[Y]
         pose_pred_msg.pose.position.z = 0.0
-        pose_pred_msg.pose.orientation.w = np.cos(x_for_control[2] / 2)
+        pose_pred_msg.pose.orientation.w = np.cos(x_for_control[THETA] / 2)
         pose_pred_msg.pose.orientation.x = 0.0
         pose_pred_msg.pose.orientation.y = 0.0
-        pose_pred_msg.pose.orientation.z = np.sin(x_for_control[2] / 2)
+        pose_pred_msg.pose.orientation.z = np.sin(x_for_control[THETA] / 2)
 
         twist_pred_msg = TwistStamped()
         twist_pred_msg.header.stamp = stamp.to_msg()
         twist_pred_msg.header.frame_id = 'world'
-        twist_pred_msg.twist.linear.x = x_for_control[3]
-        twist_pred_msg.twist.linear.y = x_for_control[4]
+        twist_pred_msg.twist.linear.x = x_for_control[VX]
+        twist_pred_msg.twist.linear.y = x_for_control[VY]
         twist_pred_msg.twist.linear.z = 0.0
         twist_pred_msg.twist.angular.x = 0.0
         twist_pred_msg.twist.angular.y = 0.0
-        twist_pred_msg.twist.angular.z = x_for_control[5]
+        twist_pred_msg.twist.angular.z = x_for_control[OMEGA]
 
         px4_timestamp = int(stamp.nanoseconds / 1e3)
         control_msg = DelayWrenchControl()
@@ -256,9 +306,9 @@ class ControllerInstance():
         control_msg.vehicle_thrust_setpoint = VehicleThrustSetpoint()
         control_msg.vehicle_torque_setpoint = VehicleTorqueSetpoint()
         control_msg.vehicle_thrust_setpoint.timestamp = px4_timestamp
-        control_msg.vehicle_thrust_setpoint.xyz = [u[0], u[1], 0.0] # worked on Gazebo Sim so far.
-        control_msg.vehicle_torque_setpoint.timestamp = px4_timestamp 
-        control_msg.vehicle_torque_setpoint.xyz = [0.0, 0.0, u[2]]
+        control_msg.vehicle_thrust_setpoint.xyz = [u[FX], u[FY], 0.0] # worked on Gazebo Sim so far.
+        control_msg.vehicle_torque_setpoint.timestamp = px4_timestamp
+        control_msg.vehicle_torque_setpoint.xyz = [0.0, 0.0, u[ALPHA]]
 
         control_msg.robot_name = self.ns
 
@@ -269,20 +319,20 @@ class ControllerInstance():
 
     def register_setpoint(self, pose_sp: PoseStamped, twist_sp: TwistStamped, no_twist=True):
         if pose_sp is not None:
-            self.x0[0] = pose_sp.pose.position.x
-            self.x0[1] = pose_sp.pose.position.y
-            self.x0[2] = 2.0 * np.arctan2(pose_sp.pose.orientation.z, pose_sp.pose.orientation.w)
+            self.x0[X] = pose_sp.pose.position.x
+            self.x0[Y] = pose_sp.pose.position.y
+            self.x0[THETA] = 2.0 * np.arctan2(pose_sp.pose.orientation.z, pose_sp.pose.orientation.w)
         else:
             pass # keep pose unchanged
 
         if twist_sp is not None:
-            self.x0[3] = twist_sp.twist.linear.x
-            self.x0[4] = twist_sp.twist.linear.y
-            self.x0[5] = twist_sp.twist.angular.z
+            self.x0[VX]    = twist_sp.twist.linear.x
+            self.x0[VY]    = twist_sp.twist.linear.y
+            self.x0[OMEGA] = twist_sp.twist.angular.z
         elif no_twist:
-            self.x0[3] = 0.0
-            self.x0[4] = 0.0
-            self.x0[5] = 0.0
+            self.x0[VX]    = 0.0
+            self.x0[VY]    = 0.0
+            self.x0[OMEGA] = 0.0
         else:
             pass # keep twist unchanged
 
@@ -291,7 +341,7 @@ class MultiWrenchControl(Node):
     def __init__(self):
         super().__init__('multi_wrench_control')
 
-        self.namespaces = self.declare_parameter('namespaces', ['']).value
+        self.namespaces      = self.declare_parameter('namespaces', ['']).value
         self.simulated_delay = self.declare_parameter('simulated_delay', False).value
         qos_profile = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -311,8 +361,10 @@ class MultiWrenchControl(Node):
         self.control_on = {}
         for ns in self.namespaces:
             self.control_on[ns] = True
+        
         self.control_on_sub = [
             self.create_subscription(Bool, f'/{ns}/control_on', partial(self.control_on_callback, namespace=ns), qos_profile)
+            for ns in self.namespaces
         ]
 
         self.control_pub = self.create_publisher(
