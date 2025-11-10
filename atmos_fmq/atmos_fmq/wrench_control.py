@@ -202,9 +202,7 @@ class ControllerInstance():
             worst_lyap_val = -np.inf
             Aineq          = []
             bineq          = []
-
-            # print(self.ns, self.x0, self.x)
-            n_preds = 10
+            n_preds        = 10
             for _ in range(n_preds):
                 x0 = self.x0.copy()
                 # delay_profile = [np.clip(self.ctrl_dt + random.uniform(self.model.delay_min, self.model.delay_max) - random.uniform(self.model.delay_min, self.model.delay_max), 0.0, np.inf) for _ in range(len(self.pending_inputs))]

@@ -41,29 +41,29 @@ class MsgHandlerRobot(Node):
         self.mode = 'wrench'
 
         # Initialize variables
-        self.lpe = None
-        self.attitude = None
+        self.lpe              = None
+        self.attitude         = None
         self.angular_velocity = None
-        self.status = None
-        self.received_ctl = None
+        self.status           = None
+        self.received_ctl     = None
 
         # Get namespace
         self.namespace = self.declare_parameter('namespace', '').value
         self.namespace_prefix = f'/{self.namespace}' if self.namespace else ''
 
         # Send out State
-        self.fmq_state_pub = self.create_publisher(RobotState,  f'{self.namespace_prefix}/fmq/state', qos_profile)
-        self.local_position_sub = self.create_subscription(VehicleLocalPosition,  f'{self.namespace_prefix}/fmu/out/vehicle_local_position', self.local_position_callback, qos_profile_sub)
-        self.attitude_sub = self.create_subscription(VehicleAttitude,  f'{self.namespace_prefix}/fmu/out/vehicle_attitude', self.attitude_callback, qos_profile_sub)
+        self.fmq_state_pub        = self.create_publisher(RobotState,                 f'{self.namespace_prefix}/fmq/state', qos_profile)
+        self.local_position_sub   = self.create_subscription(VehicleLocalPosition,    f'{self.namespace_prefix}/fmu/out/vehicle_local_position', self.local_position_callback, qos_profile_sub)
+        self.attitude_sub         = self.create_subscription(VehicleAttitude,         f'{self.namespace_prefix}/fmu/out/vehicle_attitude', self.attitude_callback, qos_profile_sub)
         self.angular_velocity_sub = self.create_subscription(VehicleAngularVelocity,  f'{self.namespace_prefix}/fmu/out/vehicle_angular_velocity', self.angular_velocity_callback, qos_profile_sub)
-        self.status_sub = self.create_subscription(VehicleStatus,  f'{self.namespace_prefix}/fmu/out/vehicle_status', self.status_callback, qos_profile_sub)
+        self.status_sub           = self.create_subscription(VehicleStatus,           f'{self.namespace_prefix}/fmu/out/vehicle_status', self.status_callback, qos_profile_sub)
 
         # Handle Controls
-        self.fmq_control_sub = self.create_subscription(WrenchControl,  f'{self.namespace_prefix}/fmq/control', self.control_callback, qos_profile)
-        self.publisher_direct_actuator = self.create_publisher(ActuatorMotors,  f'{self.namespace_prefix}/fmu/in/actuator_motors', qos_profile_pub)
+        self.fmq_control_sub           = self.create_subscription(WrenchControl,       f'{self.namespace_prefix}/fmq/control', self.control_callback, qos_profile)
+        self.publisher_direct_actuator = self.create_publisher(ActuatorMotors,         f'{self.namespace_prefix}/fmu/in/actuator_motors', qos_profile_pub)
         self.publisher_thrust_setpoint = self.create_publisher(VehicleThrustSetpoint,  f'{self.namespace_prefix}/fmu/in/vehicle_thrust_setpoint', qos_profile_pub)
         self.publisher_torque_setpoint = self.create_publisher(VehicleTorqueSetpoint,  f'{self.namespace_prefix}/fmu/in/vehicle_torque_setpoint', qos_profile_pub)
-        self.publisher_offboard_mode = self.create_publisher(OffboardControlMode,  f'{self.namespace_prefix}/fmu/in/offboard_control_mode', qos_profile_pub)
+        self.publisher_offboard_mode   = self.create_publisher(OffboardControlMode,    f'{self.namespace_prefix}/fmu/in/offboard_control_mode', qos_profile_pub)
 
         # Create timers
         self.timer_control = self.create_timer(0.1, self.robot_ctl_callback)
