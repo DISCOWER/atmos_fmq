@@ -31,7 +31,7 @@ Run the bridge node
 ```
 ros2 run ros_fmq_bridge bridge_node
 ```
-Run the Docker file. From the package ros_fmq_bridge, within the folder docker, run:
+Run the Docker file. From the package ros_fmq_bridge, within the folder docker, run (you may have to use sudo):
 ```
 docker compose -f docker-compose-vehicle-linux-{name_of_the_robot}.yml up
 ```
@@ -45,7 +45,7 @@ ros2 launch atmos_fmq multirobot_test_robot.launch.py namespaces:=pop
 
 ## Remote operator
 
-Run the Docker file. From the package ros_fmq_bridge, within the folder docker, run:
+Run the Docker file. From the package ros_fmq_bridge, within the folder docker, run (you may have to use sudo):
 ```
 docker compose -f docker-compose-operator-linux-{name_of_the_robot}.yml up
 ```
