@@ -20,18 +20,46 @@ ros2 launch atmos_fmq robot_launch.py namespace:=crackle remote_control:=<true|f
 **WARNING**: The `remote_control:=true` was not yet tested on hardware.
 
 ### Running the Interface with Simulation
-To run the interface in simulation ensure that you are running the PX4 SITL simulation with `crackle` namespace. The remaining steps will be the same.
+To run the interface in simulation, ensure that you are running the PX4 SITL simulation with `crackle` namespace. The remaining steps will be the same.
 
-### Running the docket
+### Running the experiments
 
-Here is an example of how to run the Docker file for the vehicle operator
+## Local Operator (Vehicle)
 
+Run the bridge node 
+
+```
+ros2 run ros_fmq_bridge bridge_node
+```
+Run the Docker file
 ```
 docker compose -f docker-compose-vehicle-linux.yml up
 ```
 
-and for the remote operator 
+Finally, launch the control feeder node 
 
+```
+ros2 launch atmos_fmq multirobot_test_robot.launch.py namespaces:=pop
+```
+
+## Remote operator
+
+Launch the Docker
 ```
 docker compose -f docker-compose-operator-linux.yml up
 ```
+
+Launch the bridge
+
+
+```
+ros2 run ros_fmq_bridge bridge_node
+```
+
+Launch the controller
+
+```
+ros2 launch atmos_fmq multirobot_test_controller.launch.py namespaces:=pop
+```
+
+
