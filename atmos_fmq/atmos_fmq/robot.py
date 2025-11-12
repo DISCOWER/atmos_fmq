@@ -1,3 +1,4 @@
+from typing import NamedTuple
 import rclpy
 
 from rclpy.subscription import Subscription
@@ -6,11 +7,17 @@ from rclpy.node import Node
 from rclpy.time import Time, Duration
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
 
-from atmos_fmq_msgs.msg import DelayRobotState, MultiDelayRobotState, MultiDelayWrenchControl
+from atmos_fmq_msgs.msg import RobotStateResponse, ControlRequest, MultiRobotStateResponse, MultiControlRequest
 from px4_msgs.msg import VehicleTorqueSetpoint, VehicleThrustSetpoint, OffboardControlMode, VehicleAngularVelocity, VehicleAttitude, VehicleLocalPosition
 
 from copy import deepcopy
 from functools import partial
+
+
+class RequestItem(NamedTuple):
+    control_request      : ControlRequest      # Id of the control input
+    arrival_time         : Time     # time at which the control input arrived to the robot 
+
 
 class ControlFeeder(Node):
     def __init__(self):
@@ -24,46 +31,49 @@ class ControlFeeder(Node):
 
         super().__init__('control_feeder')
 
+        self.state_msg_id : int = 0
+
         qos_profile      = QoSProfile(
             reliability  = QoSReliabilityPolicy.BEST_EFFORT,
             history      = QoSHistoryPolicy.KEEP_LAST,
             depth        = 10,
         )
 
-        # Timers
+        # Create timers: state and control are published to onboard fmu and remote controller
         rate = 10.0 # Hz
         self.pub_to_robot_timer = self.create_timer(1.0 / rate, self.publish_to_robots)
         self.pub_to_ctrl_timer  = self.create_timer(1.0 / rate, self.publish_to_controller)
 
-        # FleetMQ messages pub/sub
-        self.state_pub   = self.create_publisher(MultiDelayRobotState, '/pop/fmq/state', qos_profile)
-        self.control_sub = self.create_subscription(MultiDelayWrenchControl, '/pop/fmq/control', self.control_callback, qos_profile)
 
         # Get namespace names
         self.namespaces = self.declare_parameter('namespaces', ['']).value
 
         # Create pub/sub and internal states for each namespace
-        self.thrust_setpoint_pubs: dict[str, Publisher] = {}
-        self.torque_setpoint_pubs: dict[str, Publisher] = {}
-        self.offboard_control_mode_pubs: dict[str, Publisher] = {}
+        self.thrust_setpoint_pubs       : dict[str, Publisher] = {}
+        self.torque_setpoint_pubs       : dict[str, Publisher] = {}
+        self.offboard_control_mode_pubs : dict[str, Publisher] = {}
 
-        self.angular_velocity_subs: dict[str, list[Subscription]] = {}
-        self.attitude_subs        : dict[str, list[Subscription]] = {}
-        self.local_position_subs  : dict[str, list[Subscription]] = {}
- 
-        self.latest_thrust_setpoints       : dict[str, VehicleThrustSetpoint] = {}
-        self.latest_torque_setpoints       : dict[str, VehicleTorqueSetpoint] = {}
-        self.latest_offboard_control_modes : dict[str, OffboardControlMode] = {}
-        self.latest_control_ids            : dict[str, int] = {}
-        self.rec_times                     : dict[str, list[int, Time, Duration]] = {}
-        self.control_arrival_times         : dict[str, Time] = {}
+        self.angular_velocity_subs      : dict[str, list[Subscription]] = {}
+        self.attitude_subs              : dict[str, list[Subscription]] = {}
+        self.local_position_subs        : dict[str, list[Subscription]] = {}
+
+        self.state_pubs                 : dict[str, Publisher]    = {}
+        self.control_subs               : dict[str, Subscription] = {}         
+
+        self.control_requests_queue        : dict[str, list[RequestItem]]  = {} # for each control input, record (control_request, arrival_time)
+        self.latest_control_id             : dict[str, int]  = {}
+        self.latest_control_execution_time : dict[str, Time] = {}
+        self.transmission_delays           : list[Duration]  = []
 
         self.control_on                     : dict[str, bool] = {}
         self.angular_velocity_on            : dict[str, bool] = {}
         self.attitude_on                    : dict[str, bool] = {}
         self.local_position_on              : dict[str, bool] = {}
 
-        self.delay_robot_state_msgs         : dict[str, DelayRobotState] = {}
+        self.vehicle_angular_velocity       : dict[str, VehicleAngularVelocity] = {}
+        self.vehicle_attitude               : dict[str, VehicleAttitude]        = {}
+        self.vehicle_local_position         : dict[str, VehicleLocalPosition]   = {}
+        self.delay_robot_state_msgs         : dict[str, RobotStateResponse]     = {}
 
         for ns in self.namespaces:
             msg_prefix = '' if ns == '' else f'/{ns}'
@@ -71,140 +81,144 @@ class ControlFeeder(Node):
             self.torque_setpoint_pubs[ns]       = self.create_publisher(VehicleTorqueSetpoint, f'{msg_prefix}/fmu/in/vehicle_torque_setpoint', qos_profile)
             self.offboard_control_mode_pubs[ns] = self.create_publisher(OffboardControlMode, f'{msg_prefix}/fmu/in/offboard_control_mode', qos_profile)
 
-            self.angular_velocity_subs[ns] = [self.create_subscription(
-                VehicleAngularVelocity,
-                f'{msg_prefix}/fmu/out/vehicle_angular_velocity',
-                partial(self.angular_velocity_callback, namespace=ns),
-                qos_profile
-            )]
-            self.angular_velocity_subs[ns] += [self.create_subscription(
-                VehicleAngularVelocity,
-                f'{msg_prefix}/fmu/out/vehicle_angular_velocity_v1',
-                partial(self.angular_velocity_callback, namespace=ns),
-                qos_profile
-            )]
+            # FleetMQ messages pub/sub
+            self.state_pubs[ns]    = self.create_publisher(MultiRobotStateResponse, f'{msg_prefix}/fmq/state', qos_profile)
+            self.control_subs[ns]  = self.create_subscription(MultiControlRequest, f'{msg_prefix}/fmq/control', self.control_request_callback, qos_profile)
 
+            # subscription to px4 topics
+            # added version v1 for compatibility with older PX4 versions
+            self.angular_velocity_subs[ns] = [self.create_subscription( VehicleAngularVelocity, f'{msg_prefix}/fmu/out/vehicle_angular_velocity', partial(self.angular_velocity_callback, namespace=ns), qos_profile)]
+            self.angular_velocity_subs[ns] += [self.create_subscription( VehicleAngularVelocity, f'{msg_prefix}/fmu/out/vehicle_angular_velocity_v1', partial(self.angular_velocity_callback, namespace=ns), qos_profile)]
+            
+            self.attitude_subs[ns]         = [self.create_subscription(VehicleAttitude, f'{msg_prefix}/fmu/out/vehicle_attitude', partial(self.attitude_callback, namespace=ns), qos_profile)]
+            self.attitude_subs[ns]         += [self.create_subscription(VehicleAttitude, f'{msg_prefix}/fmu/out/vehicle_attitude_v1', partial(self.attitude_callback, namespace=ns), qos_profile)]
+            
+            self.local_position_subs[ns]   = [self.create_subscription(VehicleLocalPosition,f'{msg_prefix}/fmu/out/vehicle_local_position',partial(self.local_position_callback, namespace=ns), qos_profile)]
+            self.local_position_subs[ns]   += [self.create_subscription(VehicleLocalPosition,f'{msg_prefix}/fmu/out/vehicle_local_position_v1',partial(self.local_position_callback, namespace=ns), qos_profile)]
 
+            self.control_on[ns]             = False
+            self.angular_velocity_on[ns]    = False
+            self.attitude_on[ns]            = False
+            self.local_position_on[ns]      = False
 
-
-            self.attitude_subs[ns] = [self.create_subscription(
-                VehicleAttitude,
-                f'{msg_prefix}/fmu/out/vehicle_attitude',
-                partial(self.attitude_callback, namespace=ns),
-                qos_profile
-            )]
-            self.attitude_subs[ns] += [self.create_subscription(
-                VehicleAttitude,
-                f'{msg_prefix}/fmu/out/vehicle_attitude_v1',
-                partial(self.attitude_callback, namespace=ns),
-                qos_profile
-            )]
-
-            self.local_position_subs[ns] = [self.create_subscription(
-                VehicleLocalPosition,
-                f'{msg_prefix}/fmu/out/vehicle_local_position',
-                partial(self.local_position_callback, namespace=ns),
-                qos_profile
-            )]
-            self.local_position_subs[ns] += [self.create_subscription(
-                VehicleLocalPosition,
-                f'{msg_prefix}/fmu/out/vehicle_local_position_v1',
-                partial(self.local_position_callback, namespace=ns),
-                qos_profile
-            )]
-
-            self.latest_thrust_setpoints[ns] = VehicleThrustSetpoint()
-            self.latest_torque_setpoints[ns] = VehicleTorqueSetpoint()
-            self.latest_offboard_control_modes[ns] = OffboardControlMode()
-            self.latest_control_ids[ns] = int(0)
-            self.rec_times[ns] = []
-
-            self.control_on[ns] = False
-            self.angular_velocity_on[ns] = False
-            self.attitude_on[ns] = False
-            self.local_position_on[ns] = False
-            self.delay_robot_state_msgs[ns] = DelayRobotState()
-            self.delay_robot_state_msgs[ns].robot_name = ns
 
             self.get_logger().info(f'Initialized pub/sub for robot name = \'{ns}\'')
 
     def publish_to_robots(self):
+        """
+        Publish latest control input received to onboard fmu. This is done at a fixed rate. Once a control request is sent to the robot is popped from the queue if more than one control request is in the queue.
+        """
+        
         for ns in self.namespaces:
             if self.control_on[ns]:
-                cur_T_stamp = int(self.get_clock().now().nanoseconds / 1e3)
-                self.latest_thrust_setpoints[ns].timestamp = cur_T_stamp
-                self.latest_torque_setpoints[ns].timestamp = cur_T_stamp
-                self.latest_offboard_control_modes[ns].timestamp = cur_T_stamp
-                self.thrust_setpoint_pubs[ns].publish(self.latest_thrust_setpoints[ns])
-                self.torque_setpoint_pubs[ns].publish(self.latest_torque_setpoints[ns])
-                self.offboard_control_mode_pubs[ns].publish(self.latest_offboard_control_modes[ns])
+
+                cur_time_stamp                                     = int(self.get_clock().now().nanoseconds / 1e3)
+                
+                if len(self.control_requests_queue[ns]) == 0:
+                    self.get_logger().warning(f'Control ON but no control requests in the queue for robot namespace {ns}.')
+                    continue
+
+                latest_control_request                             = self.control_requests_queue[ns][-1].control_request
+
+                latest_thrust_setpoint                             = latest_control_request.vehicle_thrust_setpoint
+                latest_torque_setpoint                             = latest_control_request.vehicle_torque_setpoint
+                latest_offboard_control_mode                       = latest_control_request.offboard_control_mode
+
+                latest_thrust_setpoint.timestamp                   = cur_time_stamp
+                latest_torque_setpoint.timestamp                   = cur_time_stamp
+                latest_offboard_control_mode.timestamp             = cur_time_stamp
+                
+                # command to px4
+                self.thrust_setpoint_pubs[ns].publish(latest_thrust_setpoint)
+                self.torque_setpoint_pubs[ns].publish(latest_torque_setpoint)
+                self.offboard_control_mode_pubs[ns].publish(latest_offboard_control_mode)
+
+                self.latest_control_execution_time[ns]    = self.get_clock().now()
+                self.latest_control_id[ns]                = latest_control_request.id
+
+
+                if len(self.control_requests_queue[ns]) > 1:
+                    # pop latest control request from the queue
+                    self.control_requests_queue[ns].pop(0)
 
     def publish_to_controller(self):
-        msg = MultiDelayRobotState()
+        """
+        Publish latest robot state to remote operators for feedback. This is done at a fixed rate
+        """
+
+        msg              = MultiRobotStateResponse()
         msg.robot_states = []
+
         for ns in self.namespaces:
             cur_time = self.get_clock().now()
-            if self.control_on[ns] and self.angular_velocity_on[ns] and self.attitude_on[ns] and self.local_position_on[ns]:
-                self.delay_robot_state_msgs[ns].header.stamp = cur_time.to_msg()
-                self.delay_robot_state_msgs[ns].latest_ctrl_id = self.latest_control_ids[ns]
-                self.delay_robot_state_msgs[ns].sec_since_latest_ctrl = (cur_time - self.control_arrival_times[ns]).nanoseconds / 1e9
-                self.delay_robot_state_msgs[ns].transmission_delays = [dur.to_msg() for _, _, dur in self.rec_times[ns]]
-                msg.robot_states.append(deepcopy(self.delay_robot_state_msgs[ns]))
-        
-        if len(msg.robot_states) == 0:
-            self.get_logger().warn(f'No robots in the list of namespace {self.namespaces} has no available states to publish. Make sure all required topics are being published from the vehicle.')
-            self.get_logger().warn(f'Control on: {self.control_on}, Angular velocity on: {self.angular_velocity_on}, Attitude on: {self.attitude_on}, Local position on: {self.local_position_on}')
-        self.state_pub.publish(msg)
 
-    def control_callback(self, msg: MultiDelayWrenchControl):
-        for control in msg.wrench_controls:
-            ns = control.robot_name
+            if self.control_on[ns] and self.angular_velocity_on[ns] and self.attitude_on[ns] and self.local_position_on[ns]:
+                
+                msg_robot                          = RobotStateResponse()
+                msg_robot.robot_name               = ns
+                msg_robot.response_time            = cur_time.to_msg()
+
+                msg_robot.latest_ctrl_id             = self.latest_control_id[ns]
+                msg_robot.interval_since_latest_ctrl = (cur_time - self.latest_control_execution_time[ns]).nanoseconds / 1e9
+                msg_robot.transmission_delays        = self.transmission_delays
+
+                # save the state in the message
+                msg_robot.vehicle_angular_velocity = self.vehicle_angular_velocity[ns]
+                msg_robot.vehicle_attitude         = self.vehicle_attitude[ns]
+                msg_robot.vehicle_local_position   = self.vehicle_local_position[ns]
+
+                msg.robot_states.append(msg_robot)
+
+
+            else :
+                self.get_logger().debug(f'Not publishing state for robot namespace {ns} because not all required topics are available yet. Control on: {self.control_on[ns]}, Angular velocity on: {self.angular_velocity_on[ns]}, Attitude on: {self.attitude_on[ns]}, Local position on: {self.local_position_on[ns]}')
+        
+
+        for ns in self.namespaces:
+            self.state_pubs[ns].publish(msg_robot)
+
+
+    def control_request_callback(self, msg: MultiControlRequest):
+        """ 
+        Callback for receiving control inputs from the remote operator. Every time a message is received it is saved as the latest control input to be sent to the robot.
+        Each message is identified by an unique id. 
+
+        The callback keeps track of the latest control inputs and their arrival times.
+        """
+        
+        new_requests = msg.wrench_controls
+
+        for control_request in new_requests:
+            ns = control_request.robot_name
+            
             if ns not in self.namespaces:
                 self.get_logger().log(f'Unknown robot name: {ns}')
                 continue
 
-            if not self.control_on[ns]:
+            if not self.control_on[ns]: # activate control flag
                 self.control_on[ns] = True
 
-            last_time = control.state_timestamp
+            self.control_requests_queue[ns].append(RequestItem(control_request = control_request, arrival_time = self.get_clock().now()))
+            # transmission delay computation 
+            self.transmission_delays.append(self.get_clock().now() - Time.from_msg(control_request.request_time))
+            if len(self.transmission_delays) > 100:
+                self.transmission_delays.pop(0)
 
-            self.latest_offboard_control_modes[ns] = control.offboard_control_mode
-            self.latest_thrust_setpoints[ns] = control.vehicle_thrust_setpoint
-            self.latest_torque_setpoints[ns] = control.vehicle_torque_setpoint
-            self.latest_control_ids[ns] = control.id
-            self.control_arrival_times[ns] = self.get_clock().now()
-
-            while True:
-                if len(self.rec_times[ns]) == 0:
-                    break
-                if self.rec_times[ns][0][1] < Time.from_msg(last_time):
-                    self.rec_times[ns].pop(0)
-                else:
-                    break
-
-            if len(self.rec_times[ns]) == 0:
-                self.rec_times[ns].append((control.id, self.control_arrival_times[ns], self.control_arrival_times[ns] - Time.from_msg(control.header.stamp)))
-            elif len(self.rec_times[ns]) > 0:
-                if self.rec_times[ns][-1][0] < control.id:
-                    id_prev = self.rec_times[ns][-1][0]
-                    for id in range(id_prev + 1, control.id):
-                        self.rec_times[ns].append((id, self.control_arrival_times[ns], Duration(seconds=1e8))) # append big time to represent drops
-                    self.rec_times[ns].append((control.id, self.control_arrival_times[ns], self.control_arrival_times[ns] - Time.from_msg(control.header.stamp)))
 
     def angular_velocity_callback(self, msg: VehicleAngularVelocity, namespace):
         if not self.angular_velocity_on[namespace]:
             self.angular_velocity_on[namespace] = True
-        self.delay_robot_state_msgs[namespace].vehicle_angular_velocity = deepcopy(msg)
+        self.vehicle_angular_velocity[namespace] = deepcopy(msg)
 
     def attitude_callback(self, msg: VehicleAttitude, namespace):
         if not self.attitude_on[namespace]:
             self.attitude_on[namespace] = True
-        self.delay_robot_state_msgs[namespace].vehicle_attitude = deepcopy(msg)
+        self.vehicle_attitude[namespace] = deepcopy(msg)
 
     def local_position_callback(self, msg: VehicleLocalPosition, namespace):
         if not self.local_position_on[namespace]:
             self.local_position_on[namespace] = True
-        self.delay_robot_state_msgs[namespace].vehicle_local_position = deepcopy(msg)
+        self.vehicle_local_position[namespace] = deepcopy(msg)
 
 
 def main(args=None):

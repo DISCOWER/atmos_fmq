@@ -2,19 +2,21 @@ import rclpy
 import numpy as np
 from qpsolvers import solve_qp
 
-from rclpy.node import Node
+from rclpy.node import Node,Publisher, Subscription
 from rclpy.clock import Clock
 from rclpy.time import Time, Duration
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
 
 from std_msgs.msg import Bool
 from geometry_msgs.msg import PoseStamped, TwistStamped
-from atmos_fmq_msgs.msg import DelayRobotState, DelayWrenchControl, MultiDelayRobotState, MultiDelayWrenchControl
+from atmos_fmq_msgs.msg import RobotStateResponse, ControlRequest, MultiRobotStateResponse, MultiControlRequest
 from px4_msgs.msg import OffboardControlMode, VehicleThrustSetpoint, VehicleTorqueSetpoint
 
 import random
 from functools import partial
 
+
+# state indices
 X     = 0
 Y     = 1
 THETA = 2
@@ -37,7 +39,7 @@ def wrap_to_pi(x_):
             break
     return x
 
-class SpacecraftModel():
+class SpacecraftModel:
     def __init__(self):
 
         """
@@ -147,54 +149,77 @@ class SpacecraftModel():
         u[ALPHA] = np.clip(u[ALPHA], -self.max_torque, self.max_torque)
 
         return u
-    
-class ControllerInstance():
-    def __init__(self, ns: str='', x=np.zeros(6), ctrl_dt=0.1):
-        
-        
-        self.ns        = ns
-        self.x0        = x.copy() # desired state, set to initial state at start
-        self.x0[THETA] = wrap_to_pi(self.x0[THETA])
-        self.x         = x.copy() # state from the robot
-        self.x[THETA]  = wrap_to_pi(self.x[THETA])
-        self.last_msg  = None
-        self.model     = SpacecraftModel()
 
 
-        self.last_setpoint_stamp = None
-        self.ctrl_id             = 0
-        self.pending_inputs      = []  # list of (id, time, input) tuples
-        self.delay_history       = []
-        self.ctrl_dt             = ctrl_dt
-    
-    def handle_state_msg(self, msg: DelayRobotState):
-        self.last_msg = msg
-        self.x[X]     = msg.vehicle_local_position.x
-        self.x[Y]     = msg.vehicle_local_position.y
-        self.x[THETA] = msg.vehicle_local_position.heading # if quaternion: 2.0 * np.arctan2(-msg.vehicle_attitude.q[3], -msg.vehicle_attitude.q[0])
-        self.x[VX]    = msg.vehicle_local_position.vx
-        self.x[VY]    = msg.vehicle_local_position.vy
-        self.x[OMEGA] = msg.vehicle_angular_velocity.xyz[2]
+class InputTuple:
+    def __init__(self, control_id: int, timestamp: Time, input: np.ndarray):
+        self.control_id = control_id  # unique control input id
+        self.timestamp  = timestamp   # time when the input was sent
+        self.input      = input       # input vector
 
-        while len(self.pending_inputs) > 0 and self.pending_inputs[0][0] < msg.latest_ctrl_id:
+class Controller:
+    """
+    Helper controller class for each robot
+
+    Handles state updates, control generation, and setpoint registration for each robot
+    """
+
+    def __init__(self, ns: str='', x = np.zeros(6), ctrl_dt=0.1):
+        """
+        Initialize the controller instance.
+        :param ns: Namespace / robot name
+        :param x: Initial state
+        :param ctrl_dt: Control update rate (sampling time)
+        """
+
+
+        self.ns                = ns
+        self.x0                = x.copy() # desired state, set to initial state at start
+        self.x0[THETA]         = wrap_to_pi(self.x0[THETA])
+        self.x                 = x.copy() # state from the robot
+        self.x[THETA]          = wrap_to_pi(self.x[THETA])
+        self.latest_state_msg  = None
+        self.model             = SpacecraftModel()
+
+
+        self.last_setpoint_stamp : Time             = None
+        self.ctrl_id             : int              = 0
+        self.pending_inputs      : list[InputTuple] = []  # list of (id, time, input) tuples
+        self.delay_history       : list[float]      = []
+        self.ctrl_dt             : float            = ctrl_dt
+
+    def handle_state_msg(self, state_msg: RobotStateResponse):
+        """
+        Handle state messages from the robot. Update internal state and manage pending inputs.
+        """
+        self.latest_state_msg = state_msg
+        self.x[X]             = state_msg.vehicle_local_position.x
+        self.x[Y]             = state_msg.vehicle_local_position.y
+        self.x[THETA]         = state_msg.vehicle_local_position.heading # if quaternion: 2.0 * np.arctan2(-msg.vehicle_attitude.q[3], -msg.vehicle_attitude.q[0])
+        self.x[VX]            = state_msg.vehicle_local_position.vx
+        self.x[VY]            = state_msg.vehicle_local_position.vy
+        self.x[OMEGA]         = state_msg.vehicle_angular_velocity.xyz[2]
+
+
+        # remove all the inputs that have already been applied
+        while len(self.pending_inputs) > 0 and self.pending_inputs[0].control_id < self.latest_state_msg.latest_ctrl_id:
             self.pending_inputs.pop(0)
 
-        for dur in msg.transmission_delays:
+        for dur in state_msg.transmission_delays:
             self.delay_history.append(dur)
             if len(self.delay_history) > 100:
                 self.delay_history.pop(0)
 
-    def generate_control(self, stamp: Time, control_on: bool ) -> tuple[DelayWrenchControl, PoseStamped, TwistStamped]:
+    def generate_control(self, stamp: Time, control_on: bool ) -> tuple[ControlRequest, PoseStamped, TwistStamped]:
         """
         Generate control message based on the current state and desired state.
-        Uses a simple PD controller for position and velocity control.
         1. Predict the state after the delay using the pending inputs.
         2. Compute the control input using the predicted state and desired state.
-        3. Package the control input into a DelayWrenchControl message.
+        3. Package the control input into a ControlRequest message.
         """
         x_for_control = np.zeros(6)
         
-        if self.last_msg is None:
+        if self.latest_state_msg is None:
             u = np.zeros(3)
         
         else:
@@ -203,6 +228,7 @@ class ControllerInstance():
             Aineq          = []
             bineq          = []
             n_preds        = 10
+            
             for _ in range(n_preds):
                 x0 = self.x0.copy()
                 # delay_profile = [np.clip(self.ctrl_dt + random.uniform(self.model.delay_min, self.model.delay_max) - random.uniform(self.model.delay_min, self.model.delay_max), 0.0, np.inf) for _ in range(len(self.pending_inputs))]
@@ -211,7 +237,7 @@ class ControllerInstance():
                     td_profile = [Duration.from_msg(random.choice(self.delay_history)).nanoseconds / 1e9 for _ in range(len(self.pending_inputs))]
                 else:
                     td_profile = [random.uniform(self.model.delay_min, self.model.delay_max) for _ in range(len(self.pending_inputs))]
-                td_profile.insert(0, -self.last_msg.sec_since_latest_ctrl)
+                td_profile.insert(0, -self.latest_state_msg.sec_since_latest_ctrl)
                 delay_profile = [np.clip(td_profile[i + 1] - td_profile[i] + self.ctrl_dt,
                                          0,
                                         self.model.delay_max + self.ctrl_dt 
@@ -264,51 +290,50 @@ class ControllerInstance():
             # u = self.model.control(x_for_control, self.x0)
             # u = self.model.control(self.x, self.x0)
 
-        pose_pred_msg = PoseStamped()
-        pose_pred_msg.header.stamp = stamp.to_msg()
-        pose_pred_msg.header.frame_id = 'world'
-        pose_pred_msg.pose.position.x = x_for_control[X]
-        pose_pred_msg.pose.position.y = x_for_control[Y]
-        pose_pred_msg.pose.position.z = 0.0
+        pose_pred_msg                    = PoseStamped()
+        pose_pred_msg.header.stamp       = stamp.to_msg()
+        pose_pred_msg.header.frame_id    = 'world'
+        pose_pred_msg.pose.position.x    = x_for_control[X]
+        pose_pred_msg.pose.position.y    = x_for_control[Y]
+        pose_pred_msg.pose.position.z    = 0.0
         pose_pred_msg.pose.orientation.w = np.cos(x_for_control[THETA] / 2)
         pose_pred_msg.pose.orientation.x = 0.0
         pose_pred_msg.pose.orientation.y = 0.0
         pose_pred_msg.pose.orientation.z = np.sin(x_for_control[THETA] / 2)
 
-        twist_pred_msg = TwistStamped()
-        twist_pred_msg.header.stamp = stamp.to_msg()
+        twist_pred_msg                 = TwistStamped()
+        twist_pred_msg.header.stamp    = stamp.to_msg()
         twist_pred_msg.header.frame_id = 'world'
-        twist_pred_msg.twist.linear.x = x_for_control[VX]
-        twist_pred_msg.twist.linear.y = x_for_control[VY]
-        twist_pred_msg.twist.linear.z = 0.0
+        twist_pred_msg.twist.linear.x  = x_for_control[VX]
+        twist_pred_msg.twist.linear.y  = x_for_control[VY]
+        twist_pred_msg.twist.linear.z  = 0.0
         twist_pred_msg.twist.angular.x = 0.0
         twist_pred_msg.twist.angular.y = 0.0
         twist_pred_msg.twist.angular.z = x_for_control[OMEGA]
 
-        px4_timestamp = int(stamp.nanoseconds / 1e3)
-        control_msg = DelayWrenchControl()
-        control_msg.header.stamp = stamp.to_msg()
-        control_msg.header.frame_id = ''
-        control_msg.id = self.ctrl_id
-        control_msg.state_timestamp = self.last_msg.header.stamp if self.last_msg is not None else Time().to_msg()
-        control_msg.offboard_control_mode = OffboardControlMode()
-        control_msg.offboard_control_mode.timestamp = px4_timestamp
-        control_msg.offboard_control_mode.position = False
-        control_msg.offboard_control_mode.velocity = False
-        control_msg.offboard_control_mode.acceleration = False
-        control_msg.offboard_control_mode.attitude = False
-        control_msg.offboard_control_mode.body_rate = False
-        control_msg.offboard_control_mode.direct_actuator = False
+        px4_timestamp                                       = int(stamp.nanoseconds / 1e3)
+
+        control_msg                                         = ControlRequest()
+        control_msg.request_time                            = stamp.to_msg()
+        control_msg.id                                      = self.ctrl_id
+        control_msg.latest_state_message_time               = self.latest_state_msg.response_delivery_time if self.latest_state_msg is not None else Time().to_msg() # time in which the state message was sent by the robot
+        control_msg.offboard_control_mode                   = OffboardControlMode()
+        control_msg.offboard_control_mode.timestamp         = px4_timestamp
+        control_msg.offboard_control_mode.position          = False
+        control_msg.offboard_control_mode.velocity          = False
+        control_msg.offboard_control_mode.acceleration      = False
+        control_msg.offboard_control_mode.attitude          = False
+        control_msg.offboard_control_mode.body_rate         = False
+        control_msg.offboard_control_mode.direct_actuator   = False
         control_msg.offboard_control_mode.thrust_and_torque = True
         
-        control_msg.vehicle_thrust_setpoint = VehicleThrustSetpoint()
-        control_msg.vehicle_torque_setpoint = VehicleTorqueSetpoint()
+        control_msg.vehicle_thrust_setpoint           = VehicleThrustSetpoint()
+        control_msg.vehicle_torque_setpoint           = VehicleTorqueSetpoint()
         control_msg.vehicle_thrust_setpoint.timestamp = px4_timestamp
-        control_msg.vehicle_thrust_setpoint.xyz = [u[FX], u[FY], 0.0] # worked on Gazebo Sim so far.
+        control_msg.vehicle_thrust_setpoint.xyz       = [u[FX], u[FY], 0.0] # worked on Gazebo Sim so far.
         control_msg.vehicle_torque_setpoint.timestamp = px4_timestamp
-        control_msg.vehicle_torque_setpoint.xyz = [0.0, 0.0, u[ALPHA]]
-
-        control_msg.robot_name = self.ns
+        control_msg.vehicle_torque_setpoint.xyz       = [0.0, 0.0, u[ALPHA]]
+        control_msg.robot_name                        = self.ns
 
         self.pending_inputs.append((self.ctrl_id, stamp, u))
         self.ctrl_id += 1
@@ -341,87 +366,69 @@ class MultiWrenchControl(Node):
 
         self.namespaces      = self.declare_parameter('namespaces', ['']).value
         self.simulated_delay = self.declare_parameter('simulated_delay', False).value
-        qos_profile = QoSProfile(
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=10,
-        )
-
-        self.ctrl_dt = 0.05 # 0.1
-
-        # add predicted pose and twist publishers (for referece generation)
-        self.pose_pub = {}
-        self.twist_pub = {}
-        for ns in self.namespaces:
-            self.pose_pub[ns] = self.create_publisher(PoseStamped, f'/{ns}/predicted_pose', qos_profile)
-            self.twist_pub[ns] = self.create_publisher(TwistStamped, f'/{ns}/predicted_twist', qos_profile)
-
-        self.control_on = {}
-        for ns in self.namespaces:
-            self.control_on[ns] = True
         
-        self.control_on_sub = [
-            self.create_subscription(Bool, f'/{ns}/control_on', partial(self.control_on_callback, namespace=ns), qos_profile)
-            for ns in self.namespaces
-        ]
+        qos_profile = QoSProfile(reliability = QoSReliabilityPolicy.BEST_EFFORT,
+                                 history     = QoSHistoryPolicy.KEEP_LAST,
+                                 depth       = 10)
 
-        self.control_pub = self.create_publisher(
-            MultiDelayWrenchControl,
-            '/fmq/control/undelayed' if self.simulated_delay else '/pop/fmq/control',
-            qos_profile
-        )
-        self.state_sub = self.create_subscription(
-            MultiDelayRobotState,
-            '/fmq/state/delayed' if self.simulated_delay else '/pop/fmq/state',
-            self.state_callback, qos_profile
-        )
-        # self.control_pub = self.create_publisher(
-        #     MultiDelayWrenchControl,
-        #     '/fmq/control/undelayed' if self.simulated_delay else '/fmq/control',
-        #     qos_profile
-        # )
-        # self.state_sub = self.create_subscription(
-        #     MultiDelayRobotState,
-        #     '/fmq/state/delayed' if self.simulated_delay else '/fmq/state',
-        #     self.state_callback, qos_profile
-        # )
-        self.pub_timer = self.create_timer(self.ctrl_dt, self.publish_control_msgs)
+        self.ctrl_dt              : float                 = 0.05 # 0.1
+        self.robots               : dict[str, Controller] = {}
+        
+        self.predicted_pose_pub   : dict[str, Publisher] = {}
+        self.predicted_twist_pub  : dict[str, Publisher] = {}
+        self.control_pub          : dict[str, Publisher] = {}
+        
+        self.state_sub            : dict[str, Subscription] = {}
+        self.control_on_sub       : dict[str, Subscription] = {}
+        self.setpoint_subs        : dict[str, Subscription] = {}
+        self.twist_setpoint_subs  : dict[str, Subscription] = {}
+        self.pose_setpoint_subs   : dict[str, Subscription] = {}
+        
+        self.is_control_on        : dict[str, bool]         = {}
+        self.has_twist            : dict[str, bool]         = {}
 
-        self.setpoint_subs = []
-        self.robots: dict[str, ControllerInstance] = {}
-        self.has_twist: dict[str, bool] = {}
+        
         for ns in self.namespaces:
-            self.robots[ns] = ControllerInstance(ns=ns, x=np.zeros(6))
-            msg_prefix = '' if ns == '' else f'/{ns}'
-            self.setpoint_subs.append(self.create_subscription(
-                PoseStamped,
-                f'{msg_prefix}/setpoint_pose',
-                partial(self.pose_setpoint_callback, namespace=ns),
-                qos_profile
-            ))
-            self.setpoint_subs.append(self.create_subscription(
-                TwistStamped,
-                f'{msg_prefix}/setpoint_twist',
-                partial(self.twist_setpoint_callback, namespace=ns),
-                qos_profile
-            ))
-            self.has_twist[ns] = False
-        self.get_clock().now()
 
-    def state_callback(self, msg: MultiDelayRobotState):
+            # Create publisher of predicted states and control commands from each robot (the predicted state is based on the given control commands and delay model)
+            self.predicted_pose_pub[ns]   = self.create_publisher(PoseStamped, f'/{ns}/predicted_pose', qos_profile)
+            self.predicted_twist_pub[ns]  = self.create_publisher(TwistStamped, f'/{ns}/predicted_twist', qos_profile)
+            self.control_pub[ns]          = self.create_publisher(MultiControlRequest, f'/{ns}/fmq/control', qos_profile)
+            
+            # Create subscriber to get state messages from each robot
+            self.control_on_sub[ns]       = self.create_subscription(Bool, f'/{ns}/control_on', partial(self.control_on_callback, namespace=ns), qos_profile)
+            self.state_sub[ns]            = self.create_subscription(MultiRobotStateResponse, f'/{ns}/fmq/state', self.state_callback, qos_profile)
+
+            self.twist_setpoint_subs[ns]  = self.create_subscription(TwistStamped, f'/{ns}/fmq/setpoint_twist', partial(self.twist_setpoint_callback, namespace=ns), qos_profile)
+            self.pose_setpoint_subs[ns]   = self.create_subscription(PoseStamped, f'/{ns}/fmq/setpoint_pose', partial(self.pose_setpoint_callback, namespace=ns), qos_profile)
+
+            self.is_control_on[ns]        = True
+            self.has_twist[ns]            = False
+
+            # create controller instance for each robot
+            self.robots[ns]  = Controller(ns = ns, x = np.zeros(6))
+
+
+        self.pub_timer     = self.create_timer(self.ctrl_dt, self.publish_control_msgs) # control publish timer
+        self.setpoint_subs = []        
+
+    def state_callback(self, msg: MultiRobotStateResponse):
+        """Get latest state messages from all robots and update controllers."""
         for robot_state in msg.robot_states:
-            self.robots[robot_state.robot_name].handle_state_msg(robot_state)
+            controller = self.robots.get(robot_state.robot_name)
+            controller.handle_state_msg(robot_state)
 
     def publish_control_msgs(self):
-        msg = MultiDelayWrenchControl()
+        msg = MultiControlRequest()
 
-        for (ns, inst) in self.robots.items():
-            wrench_control, pose, twist = inst.generate_control(self.get_clock().now(), self.control_on[ns])
+        for (ns, controller) in self.robots.items():
+            current_time                = self.get_clock().now()
+            wrench_control, pose, twist = controller.generate_control(current_time, self.is_control_on[ns])
+
             msg.wrench_controls.append(wrench_control)
-            self.pose_pub[ns].publish(pose)
-            self.twist_pub[ns].publish(twist)
-
-        self.control_pub.publish(msg)
+            self.predicted_pose_pub[ns].publish(pose)
+            self.predicted_twist_pub[ns].publish(twist)
+            self.control_pub[ns].publish(msg)
 
     def pose_setpoint_callback(self, msg: PoseStamped, namespace: str):
         if self.robots[namespace] is not None:
@@ -433,7 +440,7 @@ class MultiWrenchControl(Node):
             self.robots[namespace].register_setpoint(pose_sp=None, twist_sp=msg, no_twist=False)
 
     def control_on_callback(self, msg: Bool, namespace: str):
-        self.control_on[namespace] = msg.data
+        self.is_control_on[namespace] = msg.data
 
 
 def main(args=None):
