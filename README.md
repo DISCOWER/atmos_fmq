@@ -36,6 +36,7 @@ Run the Docker file. From the package ros_fmq_bridge, within the folder docker, 
 docker compose -f docker-compose-vehicle-linux-{name_of_the_robot}.yml up
 ```
 where in place of {name_of_the_robot} you should put the name of the robot you are using. Check that the corresponding file is available in the docker folder.
+**FLEETMQ WARNING**: After the update, each device has its own docker file 
 
 Finally, launch the control feeder node 
 
