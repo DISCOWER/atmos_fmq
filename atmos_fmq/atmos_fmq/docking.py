@@ -1,10 +1,7 @@
 import rclpy
 
-from rclpy.subscription import Subscription
-from rclpy.publisher import Publisher
 from rclpy.node import Node
-from rclpy.time import Time, Duration
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
 import numpy as np
 import casadi as ca
@@ -136,21 +133,22 @@ class Docking(Node):
         self.parking_vel         = np.array([0.0, 0.0     , 0.0])                 # vx, vy, yaw_rate (velocity to be reached before the frontal docking starts)
         # if slower speed needed, set parking x position close to the docking pose
 
-        self.pose_pub       = self.create_publisher(PoseStamped    , f'/{self.namespace}/setpoint_pose', qos_profile)
-        self.twist_pub      = self.create_publisher(TwistStamped   , f'/{self.namespace}/setpoint_twist', qos_profile)
-        self.control_on_pub = self.create_publisher(Bool           , f'/{self.namespace}/control_on', qos_profile)
+        self.pose_setpoint_pub   = self.create_publisher(PoseStamped    , f'/{self.namespace}/setpoint_pose', qos_profile)
+        self.twist_setpoint_pub  = self.create_publisher(TwistStamped   , f'/{self.namespace}/setpoint_twist', qos_profile)
+        self.control_on_pub      = self.create_publisher(Bool           , f'/{self.namespace}/control_on', qos_profile)
 
-        self.pose_sub       = self.create_subscription(PoseStamped , f'/{self.namespace}/predicted_pose', self.pose_callback, qos_profile)
-        self.twist_sub      = self.create_subscription(TwistStamped, f'/{self.namespace}/predicted_twist', self.twist_callback, qos_profile)
+        self.predicted_pose_sub   = self.create_subscription(PoseStamped , f'/{self.namespace}/predicted_pose', self.pose_callback, qos_profile)
+        self.predicted_twist_sub  = self.create_subscription(TwistStamped, f'/{self.namespace}/predicted_twist', self.twist_callback, qos_profile)
 
         self.mpc_timer = self.create_timer(1.0, self.compute_traj)
         self.pub_timer = self.create_timer(0.1, self.publish_setpoints)
 
         self.x_pred = np.zeros(6) # x, y, yaw, vx, vy, yaw_rate (full state)
 
-        self.has_pose  = False   # Flag to mark the correct acquisition of the pose
-        self.has_twist = False   # Flag to mark the correct acquisition of the twist
-
+        self.is_pred_pose_available  = False   # Flag to mark the correct acquisition of the pose
+        self.is_pred_twist_available = False   # Flag to mark the correct acquisition of the twist
+        
+        self.already_parking_pose_reached = False
         self.docking_success = False
         self.traj            = None
         self.traj_start_time = None
@@ -168,7 +166,7 @@ class Docking(Node):
         self.mpc_planner  = MPCPlanner(self.max_force, self.N, self.dt_mpc)
 
     def pose_callback(self, msg: PoseStamped):
-        self.has_pose  = True
+        self.is_pred_pose_available  = True
         self.x_pred[0] = msg.pose.position.x
         self.x_pred[1] = msg.pose.position.y
 
@@ -179,23 +177,16 @@ class Docking(Node):
         self.x_pred[2] = np.arctan2(siny_cosp, cosy_cosp)
 
     def twist_callback(self, msg: TwistStamped):
-        self.has_twist = True
+        self.is_pred_twist_available = True
         self.x_pred[3] = msg.twist.linear.x
         self.x_pred[4] = msg.twist.linear.y
         self.x_pred[5] = msg.twist.angular.z
 
     def compute_traj(self):
-        if not (self.has_pose and self.has_twist):
-            self.get_logger().info('Waiting for pose and twist from the wrench controller...')
+        
+        if not (self.is_pred_pose_available and self.is_pred_twist_available):
+            self.get_logger().info('Waiting for predicted pose and twist from the wrench controller...')
             self.traj = None
-            return
-
-        if self.traj is not None: # If the trajectory was already computed then no need to recompute
-            self.get_logger().info('Following computed trajectory...')
-            return
-    
-        if self.docking_success:
-            self.get_logger().info('Successfully docked, no more trajectory computation!')
             return
 
         # do not start solving mpc if too far away from parking pose
@@ -203,124 +194,149 @@ class Docking(Node):
         vel_tolerance  = 0.2
         predicted_pose = self.x_pred[0:3]
         predicted_vel  = self.x_pred[3:6]
-        
-        if np.linalg.norm(predicted_pose - self.parking_pose) > pos_tolerance or np.linalg.norm(predicted_vel - self.parking_vel) > vel_tolerance:
-            self.get_logger().info('going toward parking pose first... current error to parking pose: position %.2f m' % np.linalg.norm(predicted_pose - self.parking_pose) + ' velocity %.2f m/s' % np.linalg.norm(predicted_vel - self.parking_vel))
-            return
 
-        # extract indices 0, 1, 3, 4 from x_pred (x,y,vx,vy)
-        x0_mpc = np.array([self.x_pred[0], self.x_pred[1], self.x_pred[3], self.x_pred[4]])
-        xf_mpc = np.array([self.docking_target_pose[0], self.docking_target_pose[1], self.docking_target_vel[0], self.docking_target_vel[1]])
+        is_parking_pose_reached = (np.linalg.norm(predicted_pose - self.parking_pose) <= pos_tolerance and np.linalg.norm(predicted_vel - self.parking_vel) <= vel_tolerance)
+                    
+        if is_parking_pose_reached and not self.already_parking_pose_reached:
+            self.already_parking_pose_reached = True # set to true first time the parking pose is reached
         
-        try:
-            u_trj,x_trj = self.mpc_planner.solve(x0_mpc, xf_mpc)
-            self.traj = x_trj.T
-            self.traj_start_time = self.get_clock().now()
-            self.get_logger().info('Found feasible docking trajectory')
+        
+        if self.already_parking_pose_reached and self.traj is None: # only computed once when parking pose is reached
+            self.get_logger().info('Reached parking pose, computing docking trajectory...')
 
-        except RuntimeError as e:
-            self.get_logger().error('MPC planning failed. The following error was returned: %s' % e)
-            return
+            # extract indices 0, 1, 3, 4 from x_pred (x,y,vx,vy)
+            x0_mpc = np.array([self.x_pred[0], self.x_pred[1], self.x_pred[3], self.x_pred[4]])
+            xf_mpc = np.array([self.docking_target_pose[0], self.docking_target_pose[1], self.docking_target_vel[0], self.docking_target_vel[1]])
+            
+            try:
+                u_trj,x_trj = self.mpc_planner.solve(x0_mpc, xf_mpc)
+                self.traj = x_trj.T
+                self.traj_start_time = self.get_clock().now()
+                self.get_logger().info('Found feasible docking trajectory')
+
+            except RuntimeError as e:
+                self.get_logger().error('MPC planning failed. The following error was returned: %s' % e)
+                return
+           
 
 
     def publish_setpoints(self):
         """
         Set point publisher.  
-        Publishes parking pose if no trajectory, or interpolated
-        trajectory if available. If docking
+
+        Four states :
+        1) before parking pose is reached: publish parking pose and turn off control
+        2) after parking pose is reached, before docking trajectory is computed: publish parking pose and turn on control
+        3) after docking trajectory is computed: publish interpolated trajectory setpoints
+        4) after docking trajectory is completed: publish docking pose and turn off control
+        
         """
-        pose_msg = PoseStamped()
-        pose_msg.header.stamp = self.get_clock().now().to_msg()
-        pose_msg.header.frame_id = 'world'
-        pose_msg.pose.position.x = self.parking_pose[0]
-        pose_msg.pose.position.y = self.parking_pose[1]
-        pose_msg.pose.position.z = 0.0
-        pose_msg.pose.orientation.w = np.cos(self.parking_pose[2] / 2)
-        pose_msg.pose.orientation.x = 0.0
-        pose_msg.pose.orientation.y = 0.0
-        pose_msg.pose.orientation.z = np.sin(self.parking_pose[2] / 2)
 
-        twist_msg = TwistStamped()
-        twist_msg.header.stamp = self.get_clock().now().to_msg()
-        twist_msg.header.frame_id = 'world'
-        twist_msg.twist.linear.x = 0.0
-        twist_msg.twist.linear.y = 0.0
-        twist_msg.twist.linear.z = 0.0
-        twist_msg.twist.angular.x = 0.0
-        twist_msg.twist.angular.y = 0.0
-        twist_msg.twist.angular.z = 0.0
-
-        # check if docking succeeded
-        if self.traj is not None:
-            t_now = self.get_clock().now()
-            t_elapsed = (t_now - self.traj_start_time).nanoseconds / 1.0e9
-            if t_elapsed >= self.horizon:
-                # reached the end of the trajectory
-                self.docking_success = True
-                self.traj = None
-                self.traj_start_time = None
-
-        # publish the right setpoints
-        if not (self.has_pose and self.has_twist):
-            self.control_on_pub.publish(Bool(data=False))
-            self.pose_pub.publish(pose_msg)
-            self.twist_pub.publish(twist_msg)
-            return
-
-        if self.docking_success:
-            # docking succeeded, no control
-            #  To be considered
-            # self.control_on_pub.publish(Bool(data=False))
-
-            pose_msg.pose.position.x = self.docking_target_pose[0]
-            pose_msg.pose.position.y = self.docking_target_pose[1]
-            pose_msg.pose.orientation.w = np.cos(self.docking_target_pose[2] / 2)
-            pose_msg.pose.orientation.z = np.sin(self.docking_target_pose[2] / 2)
-            self.pose_pub.publish(pose_msg)
-
-            twist_msg.twist.linear.x = self.docking_target_vel[0]
-            twist_msg.twist.linear.y = self.docking_target_vel[1]
-            twist_msg.twist.angular.z = self.docking_target_vel[2]
-            self.twist_pub.publish(twist_msg)
-            return
-
-        if self.traj is None:
-            # no feasible trajectory, move to parking pose
-            self.control_on_pub.publish(Bool(data=True))
-            self.pose_pub.publish(pose_msg)
-            self.twist_pub.publish(twist_msg)
-            return
-
-        else:
-            # linear interpolate the trajectory and publish the current pose.
-            # attitude is the same to target attitude
-            self.control_on_pub.publish(Bool(data=True))
-            t_now = self.get_clock().now()
-            t_elapsed = (t_now - self.traj_start_time).nanoseconds / 1.0e9
-
-            # find the segment
-            idx = int(t_elapsed / self.dt_mpc)
-            if idx >= self.N:
-                idx = self.N - 1
-            t_segment = t_elapsed - idx * self.dt_mpc
-            ratio = t_segment / self.dt_mpc
-
-            x0 = self.traj[idx]
-            x1 = self.traj[idx + 1]
-            x_interp = (1 - ratio) * x0 + ratio * x1
-
-            pose_msg.pose.position.x = x_interp[0]
-            pose_msg.pose.position.y = x_interp[1]
-            pose_msg.pose.orientation.w = np.cos(self.docking_target_pose[2] / 2)
-            pose_msg.pose.orientation.z = np.sin(self.docking_target_pose[2] / 2)
-            self.pose_pub.publish(pose_msg)
+        if not self.already_parking_pose_reached:
+            # publish parking pose
+            pose_msg = PoseStamped()
+            pose_msg.header.stamp = self.get_clock().now().to_msg()
+            pose_msg.header.frame_id = 'world'
+            pose_msg.pose.position.x = self.parking_pose[0]
+            pose_msg.pose.position.y = self.parking_pose[1]
+            pose_msg.pose.position.z = 0.0
+            pose_msg.pose.orientation.w = np.cos(self.parking_pose[2] / 2)
+            pose_msg.pose.orientation.x = 0.0
+            pose_msg.pose.orientation.y = 0.0
+            pose_msg.pose.orientation.z = np.sin(self.parking_pose[2] / 2)
 
             twist_msg = TwistStamped()
-            twist_msg.twist.linear.x = x_interp[2]
-            twist_msg.twist.linear.y = x_interp[3]
-            self.twist_pub.publish(twist_msg)
+            twist_msg.header.stamp = self.get_clock().now().to_msg()
+            twist_msg.header.frame_id = 'world'
+            twist_msg.twist.linear.x = 0.0
+            twist_msg.twist.linear.y = 0.0
+            twist_msg.twist.linear.z = 0.0
+            twist_msg.twist.angular.x = 0.0
+            twist_msg.twist.angular.y = 0.0
+            twist_msg.twist.angular.z = 0.0
 
-            return
+            predicted_pose = self.x_pred[0:3]
+            predicted_vel  = self.x_pred[3:6]
+
+            self.pose_setpoint_pub.publish(pose_msg)
+            self.twist_setpoint_pub.publish(twist_msg)
+            self.get_logger().info('going toward parking pose ... current error to parking pose: position %.2f m' % np.linalg.norm(predicted_pose - self.parking_pose) + ' velocity %.2f m/s' % np.linalg.norm(predicted_vel - self.parking_vel))
+        
+
+        elif self.already_parking_pose_reached : # then the trajectory is available
+            if self.docking_success :
+                # docking succeeded, no control
+                #  To be considered
+                self.control_on_pub.publish(Bool(data=False))
+                self._logger.info(f'Docking maneuver already completed, no further setpoints published. Setting control to OFF.')
+                
+                pose_msg = PoseStamped()
+                pose_msg.header.stamp = self.get_clock().now().to_msg()
+                pose_msg.header.frame_id = 'world'
+                pose_msg.pose.position.x = self.docking_target_pose[0]
+                pose_msg.pose.position.y = self.docking_target_pose[1]
+                pose_msg.pose.orientation.w = np.cos(self.docking_target_pose[2] / 2)
+                pose_msg.pose.orientation.z = np.sin(self.docking_target_pose[2] / 2)
+                self.pose_setpoint_pub.publish(pose_msg)
+                
+                twist_msg = TwistStamped()
+                twist_msg.header.stamp    = self.get_clock().now().to_msg()
+                twist_msg.header.frame_id = 'world'
+                twist_msg.twist.linear.x  = self.docking_target_vel[0]
+                twist_msg.twist.linear.y  = self.docking_target_vel[1]
+                twist_msg.twist.angular.z = self.docking_target_vel[2]
+                self.twist_setpoint_pub.publish(twist_msg)
+                return
+            else:
+                # linear interpolate the trajectory and publish the current pose.
+                # attitude is the same to target attitude
+                t_now = self.get_clock().now()
+                t_elapsed = (t_now - self.traj_start_time).nanoseconds / 1.0e9
+
+                # find the segment
+                idx = int(t_elapsed / self.dt_mpc)
+                if idx >= self.N:
+                    idx = self.N - 1
+                t_segment = t_elapsed - idx * self.dt_mpc
+                ratio = t_segment / self.dt_mpc
+
+                x0 = self.traj[idx]
+                x1 = self.traj[idx + 1]
+                x_interp = (1 - ratio) * x0 + ratio * x1
+
+                # publish next docking setpoint
+
+                pose_msg = PoseStamped()
+                pose_msg.header.stamp = self.get_clock().now().to_msg()
+                pose_msg.header.frame_id = 'world'
+                pose_msg.pose.position.x = x_interp[0]
+                pose_msg.pose.position.y = x_interp[1]
+                pose_msg.pose.position.z = 0.0
+                pose_msg.pose.orientation.w = np.cos(self.docking_target_pose[2] / 2)
+                pose_msg.pose.orientation.x = 0.0
+                pose_msg.pose.orientation.y = 0.0
+                pose_msg.pose.orientation.z = np.sin(self.docking_target_pose[2] / 2)
+
+                twist_msg = TwistStamped()
+                twist_msg.header.stamp    = self.get_clock().now().to_msg()
+                twist_msg.header.frame_id = 'world'
+                twist_msg.twist.linear.x  = x_interp[2]
+                twist_msg.twist.linear.y  = x_interp[3]
+                twist_msg.twist.linear.z  = 0.0
+                twist_msg.twist.angular.x = 0.0
+                twist_msg.twist.angular.y = 0.0
+                twist_msg.twist.angular.z = 0.0
+
+
+                self.pose_setpoint_pub.publish(pose_msg)
+                self.twist_setpoint_pub.publish(twist_msg)
+                predicted_pose = self.x_pred[0:3]
+                predicted_vel  = self.x_pred[3:6]
+                self.get_logger().info('Docking trajectory already computed, predicted error to docking pose: position %.2f m' % np.linalg.norm(predicted_pose - self.docking_target_pose) + ' velocity %.2f m/s' % np.linalg.norm(predicted_vel - self.docking_target_vel))
+                
+                if t_elapsed >= self.horizon:
+                    self.get_logger().info('Docking maneuver completed successfully!')
+                    self.docking_success = True
 
 
 def main(args=None):

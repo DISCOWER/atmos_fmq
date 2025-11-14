@@ -1,1 +1,1 @@
-atmos_fmq_msgs/DelayRobotState[] robot_states
+atmos_fmq_msgs/RobotStateResponse[] robot_states

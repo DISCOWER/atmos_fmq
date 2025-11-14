@@ -16,9 +16,21 @@ def generate_launch_description():
         description='robot names as a list of strings'
     )
 
+    simulated_delay_arg = DeclareLaunchArgument(
+        'simulated_delay',
+        description='use simulated delay',
+        default_value='False'
+    )
+
+
     namespaces = LaunchConfiguration('namespaces')
     namespaces_list = PythonExpression([
         "str('", namespaces, "').split(',')"
+    ])
+
+    simulated_delay_ = LaunchConfiguration('simulated_delay')
+    simulated_delay  = PythonExpression([
+        "bool(", simulated_delay_, ")"
     ])
 
     return LaunchDescription([
@@ -32,7 +44,8 @@ def generate_launch_description():
             output='screen',
             emulate_tty=True,
             parameters=[
-                {'namespaces': namespaces_list},
+                {'namespaces': namespaces_list,
+                 'simulated_delay': simulated_delay},
             ],
         ),
     ])

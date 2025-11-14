@@ -1,1 +1,1 @@
-atmos_fmq_msgs/DelayWrenchControl[] wrench_controls
+atmos_fmq_msgs/ControlRequest[] wrench_controls

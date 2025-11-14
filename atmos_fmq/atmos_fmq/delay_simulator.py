@@ -10,7 +10,7 @@ from collections import deque
 
 from px4_msgs.msg import VehicleAngularVelocity, VehicleAttitude, VehicleLocalPosition # subscribed by controller
 from px4_msgs.msg import OffboardControlMode, VehicleThrustSetpoint, VehicleTorqueSetpoint # published by controller
-from atmos_fmq_msgs.msg import DelayRobotState, DelayWrenchControl, MultiDelayRobotState, MultiDelayWrenchControl
+from atmos_fmq_msgs.msg import RobotStateResponse, ControlRequest, MultiControlRequest, MultiRobotStateResponse
 
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
 
@@ -24,57 +24,76 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDur
 /fmu/in/vehicle_torque_setpoint
 '''
 
-class DelayWrapper(Node):
-    def __init__(self, UseDelay=True):
-        super().__init__('delay_wrapper')
-        self.use_delay_ = UseDelay
-        self.topic_msg_dict_ = {
-            '/fmq/state': (MultiDelayRobotState, '/fmq/state/delayed'),
-            '/fmq/control/undelayed': (MultiDelayWrenchControl, '/fmq/control'),
-        }
 
-        self.publishers_ = {}
-        self.subscribers_ = {}
-        self.msg_queues = {}
+RELEASE_TIME_INDEX = 1
+MESSAGE_INDEX      = 0
+
+class DelayWrapper(Node):
+    def __init__(self):
+
+        super().__init__('delay_wrapper')
+        self.namespaces      = self.declare_parameter('namespaces', ['']).value
+        self.mean_delay     = self.declare_parameter('mean_delay', 100.0).value # ms
+        self.std_delay      = self.declare_parameter('std_delay', 20.0).value  # ms
+
+        self.message_drop_rate = 20 # percentage [0- 100]
+        self.delay_stats       = {"mean":  self.mean_delay, 
+                                   "std":  self.std_delay} # ms
+
+        self.topic_msg_dict = {}
+        for ns in self.namespaces:
+
+            self.topic_msg_dict.update(
+                                    {f'{ns}/fmq/state'  : (MultiRobotStateResponse, f'{ns}/fmq/state/delayed'),
+                                     f'{ns}/fmq/control': (MultiControlRequest    , f'{ns}/fmq/control/delayed'),
+                                    })
+
+        self.pubs = {}
+        self.subs = {}
+        self.msg_queues   = {}
 
         qos_profile = QoSProfile(
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=10,
+                                  reliability = QoSReliabilityPolicy.BEST_EFFORT,
+                                  history     = QoSHistoryPolicy.KEEP_LAST,
+                                  depth       = 10,
         )
 
         # 각 토픽에 대한 publisher/subscriber 등록
-        for topic_name_, (msg_type_, delay_pub_topic_) in self.topic_msg_dict_.items():
+        for topic_name, (msg_type, delay_pub_topic) in self.topic_msg_dict.items():
 
-            # publisher: /msg1 등
-            self.publishers_[delay_pub_topic_] = self.create_publisher(msg_type_, delay_pub_topic_, qos_profile)
-            self.msg_queues[delay_pub_topic_] = deque()
-            # subscriber: /prefix/msg1 등
-            self.subscribers_[delay_pub_topic_] = self.create_subscription(
-                msg_type_, topic_name_,
-                lambda msg, t=delay_pub_topic_: self.delay_callback(msg, t),
+            # publisher: /msg1 
+            self.pubs[delay_pub_topic]       = self.create_publisher(msg_type, delay_pub_topic, qos_profile)
+            self.msg_queues[delay_pub_topic] = deque() # queue of messages to send over the network
+            
+            # subscriber: /prefix/msg1 
+            self.subs[delay_pub_topic] = self.create_subscription(
+                msg_type,
+                topic_name,
+                lambda msg, topic=delay_pub_topic: self.delay_callback(msg, topic),
                 qos_profile
             )
 
         self.create_timer(0.01, self.delayed_publish) 
 
-    def delay_callback(self, msg, topic_name):
-        if np.random.rand() < 0.2 and self.use_delay_:
+    def delay_callback(self, msg, delay_pub_topic):
+        if np.random.rand() < self.message_drop_rate / 100.0:
             return
-        delay_ms = np.clip(np.random.rand()*300 + 100, 100, 300)
-        # delay_ms = 0
+        # random gaussian delay
+        delay_ms = max(0.0, np.random.normal(self.delay_stats["mean"], self.delay_stats["std"]))
         delay_sec = delay_ms / 1000.0
-        now = self.get_clock().now().nanoseconds / 1e9
-        release_time = (now + delay_sec) if self.use_delay_ else now
-        self.msg_queues[topic_name].append((copy.deepcopy(msg), release_time))
+        self._logger.debug(f'Delaying message on topic {delay_pub_topic} by {delay_sec:.3f} seconds')
+
+        now          = self.get_clock().now().nanoseconds / 1e9
+        release_time = (now + delay_sec) 
+        self.msg_queues[delay_pub_topic].append((copy.deepcopy(msg), release_time))
 
 
     def delayed_publish(self):
         now = self.get_clock().now().nanoseconds / 1e9
-        for topic_name, queue in self.msg_queues.items():
-            while queue and queue[0][1] <= now:
+        for delay_pub_topic, queue in self.msg_queues.items():
+            while queue and queue[0][RELEASE_TIME_INDEX] <= now:
                 msg, _ = queue.popleft()
-                self.publishers_[topic_name].publish(msg)
+                self.pubs[delay_pub_topic].publish(msg)
 
 
 def main(args=None):
