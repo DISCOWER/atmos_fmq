@@ -557,51 +557,51 @@ class RiskController:
             self.optimizer.subject_to(t_vars[i] >= losses[i] - zeta)
             self.optimizer.subject_to(t_vars[i] >= 0)
 
-            # control input constraints (keep yours)
-            self.optimizer.subject_to(self.u_var[FX]    <= self.model.max_force)
-            self.optimizer.subject_to(self.u_var[FX]    >= -self.model.max_force)
-            self.optimizer.subject_to(self.u_var[FY]    <= self.model.max_force)
-            self.optimizer.subject_to(self.u_var[FY]    >= -self.model.max_force)
+        # control input constraints (keep yours)
+        self.optimizer.subject_to(self.u_var[FX]    <= self.model.max_force)
+        self.optimizer.subject_to(self.u_var[FX]    >= -self.model.max_force)
+        self.optimizer.subject_to(self.u_var[FY]    <= self.model.max_force)
+        self.optimizer.subject_to(self.u_var[FY]    >= -self.model.max_force)
 
-            self.optimizer.subject_to(self.u_var[ALPHA] <= self.model.max_torque)
-            self.optimizer.subject_to(self.u_var[ALPHA] >= -self.model.max_torque)
+        self.optimizer.subject_to(self.u_var[ALPHA] <= self.model.max_torque)
+        self.optimizer.subject_to(self.u_var[ALPHA] >= -self.model.max_torque)
 
-            # original (u - u_ref) quadratic penalty you had
-            Q = ca.DM([
-                [1.0, 0, 0],
-                [0, 1.0, 0],
-                [0, 0, 30.0]
-            ])
+        # original (u - u_ref) quadratic penalty you had
+        Q = ca.DM([
+            [1.0, 0, 0],
+            [0, 1.0, 0],
+            [0, 0, 30.0]
+        ])
 
-            uu     = ca.vertcat(self.u_var)
-            uu_ref = ca.vertcat(self.u_ref_par)
-            control_tracking_cost = 0.5 * ca.mtimes((uu-uu_ref).T, ca.mtimes(Q, (uu - uu_ref)))
+        uu     = ca.vertcat(self.u_var)
+        uu_ref = ca.vertcat(self.u_ref_par)
+        control_tracking_cost = 0.5 * ca.mtimes((uu-uu_ref).T, ca.mtimes(Q, (uu - uu_ref)))
 
-            # explicit control-norm regularization
-            control_norm_cost = 0.5 * u_norm_weight * ca.mtimes(uu.T, uu)
+        # explicit control-norm regularization
+        control_norm_cost = 0.5 * u_norm_weight * ca.mtimes(uu.T, uu)
 
-            cost += control_tracking_cost
-            cost += control_norm_cost
+        cost += control_tracking_cost
+        cost += control_norm_cost
 
-            # CVaR computation (Rockafellar–Uryasev):
-            # CVaR_alpha = zeta + (1 / ((1 - alpha) * n_samples)) * sum_i t_i
-            sum_t = ca.sum1(t_vars)  # returns 1x1
-            cvar = zeta + (1.0 / ((1.0 - alpha) * n_samples)) * sum_t
+        # CVaR computation (Rockafellar–Uryasev):
+        # CVaR_alpha = zeta + (1 / ((1 - alpha) * n_samples)) * sum_i t_i
+        sum_t = ca.sum1(t_vars)  # returns 1x1
+        cvar = zeta + (1.0 / ((1.0 - alpha) * n_samples)) * sum_t
 
-            # add weighted CVaR to cost
-            cost += cvar_weight * cvar
+        # add weighted CVaR to cost
+        cost += cvar_weight * cvar
 
-            # finalize optimizer
-            self.optimizer.minimize(cost)
-            # keep your chosen solver
-            self.optimizer.solver("osqp")
+        # finalize optimizer
+        self.optimizer.minimize(cost)
+        # keep your chosen solver
+        self.optimizer.solver("osqp")
 
-            # function mapping: inputs are your parameters, output is the optimal u
-            self.optimal_controller = self.optimizer.to_function("controller",
-                                                                [self.x_predicted_par, self.x_ref_par, self.u_ref_par],
-                                                                [self.u_var],
-                                                                ["x_pred", "x_ref", "u_ref"],
-                                                                ["u_opt"])
+        # function mapping: inputs are your parameters, output is the optimal u
+        self.optimal_controller = self.optimizer.to_function("controller",
+                                                            [self.x_predicted_par, self.x_ref_par, self.u_ref_par],
+                                                            [self.u_var],
+                                                            ["x_pred", "x_ref", "u_ref"],
+                                                            ["u_opt"])
 
 
     def handle_state_msg(self, state_msg: RobotStateResponse):
@@ -730,7 +730,8 @@ class MultiWrenchControl(Node):
 
         self.namespaces      = self.declare_parameter('namespaces', ['']).value
         self.simulated_delay = self.declare_parameter('simulated_delay', False).value
-        
+        self.controller_type  = self.declare_parameter('controller_type', 'clf').value
+
         qos_profile = QoSProfile(reliability = QoSReliabilityPolicy.BEST_EFFORT,
                                  history     = QoSHistoryPolicy.KEEP_LAST,
                                  depth       = 10)
@@ -767,8 +768,10 @@ class MultiWrenchControl(Node):
             self.is_control_on[ns]        = True
 
             # create controller instance for each robot
-            # self.robots[ns]  = Controller(ns = ns)
-            self.robots[ns]  = RiskController(ns = ns)
+            if self.controller_type == 'clf':
+                self.robots[ns]  = Controller(ns = ns)
+            elif self.controller_type == 'cvar':
+                self.robots[ns]  = RiskController(ns = ns)
 
         self.pub_timer     = self.create_timer(self.ctrl_dt, self.publish_control_and_predicted_state_msgs) # control publish timer
         self.setpoint_subs = []        

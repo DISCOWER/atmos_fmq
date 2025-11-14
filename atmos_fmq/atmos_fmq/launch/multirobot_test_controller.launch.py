@@ -11,6 +11,7 @@ import os
 
 
 def generate_launch_description():
+
     namespaces_arg = DeclareLaunchArgument(
         'namespaces',
         description='robot names as a list of strings'
@@ -34,6 +35,12 @@ def generate_launch_description():
         default_value='30.0'
     )
 
+    controller_type_arg = DeclareLaunchArgument(
+        'controller_type',
+        description='Type of controller to use',
+        default_value='clf',
+        choices=['clf', 'cvar']
+    )
 
 
     namespaces = LaunchConfiguration('namespaces')
@@ -56,6 +63,13 @@ def generate_launch_description():
         "float(", std_delay_, ")"
     ])
 
+    simulated_delay_ = LaunchConfiguration('simulated_delay')
+    simulated_delay  = PythonExpression([
+        "bool(", simulated_delay_, ")"
+    ])
+
+    controller_type_ = LaunchConfiguration('controller_type')
+
     nodes = [
         Node(
             package='atmos_fmq',
@@ -67,7 +81,8 @@ def generate_launch_description():
             parameters=[
                 {
                     'namespaces': namespaces_list,
-                    'simulated_delay': simulated_delay
+                    'simulated_delay': simulated_delay,
+                    'controller_type': controller_type_
                 },
             ],
         ),
@@ -108,6 +123,7 @@ def generate_launch_description():
         simulated_delay_arg,
         mean_delay_arg,
         std_delay_arg,
+        controller_type_arg,
         *nodes,
 
     ])
