@@ -5,6 +5,7 @@
   <version>0.0.0</version>
   <description>messages and (de)serialization nodes for atmos-fleetmq integration and remote experiments</description>
   <maintainer email="janginkyu.larr@gmail.com">Inkyu Jang</maintainer>
+  <maintainer email="gregorio.marchesini@gmail.com">Gregorio Marchesini</maintainer>
   <author email="janginkyu.larr@gmail.com">Inkyu Jang</author>
   <license>TODO</license>
 
