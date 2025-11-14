@@ -34,6 +34,8 @@ Step 3: Run QGround Control
 ./QGroundControl-x86_64.AppImage 
 ```
 
+At this point, arm the robot from the QGroundControl Interface and pass to launching the controller and robot nodes.
+
 Note: If dds does not connect make sure that the following dds_ip is correctly set in your QGround control
 ```
 vehicle setup -> parameters -> UXRCE_DDS_AG_IP -> set to 2130706433 
