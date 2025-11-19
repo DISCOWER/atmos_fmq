@@ -35,6 +35,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         namespaces_arg,
+        simulated_delay_arg,
 
         Node(
             package='atmos_fmq',
