@@ -43,10 +43,24 @@ vehicle setup -> parameters -> UXRCE_DDS_AG_IP -> set to 2130706433
 
 ##### Setting up the controller and robot nodes
 
-Step 4: Launch the controller node
+Step 4: Launch the controller node (three options are available)
+
+For docking
 
 ```
-ros2 launch atmos_fmq multirobot_test_controller.launch.py namespaces:=pop simulated_delay:=True mean_delay:=100 std_delay:=20 controller_type:=cvar
+ros2 launch atmos_fmq docking_controller.launch.py namespaces:=pop simulated_delay:=True mean_delay:=100 std_delay:=20 controller_type:=cvar
+```
+
+For Stable point 
+
+```
+ros2 launch atmos_fmq stable_point_controller.launch.py namespaces:=pop simulated_delay:=True mean_delay:=100 std_delay:=20 controller_type:=cvar
+```
+
+For circle setpoint
+
+```
+ros2 launch atmos_fmq circle_controller.launch.py namespaces:=pop simulated_delay:=True mean_delay:=100 std_delay:=20 controller_type:=cvar
 ```
 
 options :
@@ -60,7 +74,7 @@ options :
 Step 5: Launch the robot node
 
 ```
-ros2 launch atmos_fmq multirobot_test_robot.launch.py namespaces:=pop simulated_delay:=True
+ros2 launch atmos_fmq robot.launch.py namespaces:=pop simulated_delay:=True
 ```
 `simulated_delay` (True/False) : Simulate delay in the fmq/control and fmq/state topics
 
@@ -69,14 +83,7 @@ NOTE: If you want to avoid having delay you need to set set `simulated_delay=Fal
 
 
 
-
-
-
-
-
-
-
-To run the interface in simulation ensure that you are running the PX4 SITL simulation with `crackle` namespace. The remaining steps will be the same.
+To run the interface in simulation ensure that you are running the PX4 SITL simulation with `pop` namespace. The remaining steps will be the same.
 
 
 
@@ -84,3 +91,62 @@ To run the interface in simulation ensure that you are running the PX4 SITL simu
 
 
 ### Running the Interface with Hardware
+
+Step 1:
+Launch bridge node
+
+Step 2:
+Run docker file
+
+
+
+
+Step 3: Launch the controller node (three options are available)
+
+**For docking**
+
+```
+ros2 launch atmos_fmq docking_controller.launch.py namespaces:=pop simulated_delay:=True mean_delay:=100 std_delay:=20 controller_type:=cvar
+```
+
+**For Stable point**
+
+```
+ros2 launch atmos_fmq stable_point_controller.launch.py namespaces:=pop simulated_delay:=True mean_delay:=100 std_delay:=20 controller_type:=cvar
+```
+
+**For circle setpoint**
+
+```
+ros2 launch atmos_fmq circle_controller.launch.py namespaces:=pop simulated_delay:=True mean_delay:=100 std_delay:=20 controller_type:=cvar
+```
+
+options :
+
+`simulated_delay` (True/False) : Simulate delay in the fmq/control and fmq/state topics
+`std_delay` (float) : standard deviation of the delay
+`mean_delay` (float) : mean of the delay
+`controller_type`(cvar of clf): which controller to use. CVar minimizer (KTH under testing) of CLF controller (SNU)
+
+
+Step 5: Launch the robot node
+
+```
+ros2 launch atmos_fmq robot.launch.py namespaces:=pop simulated_delay:=True
+```
+`simulated_delay` (True/False) : Simulate delay in the fmq/control and fmq/state topics
+
+
+NOTE: If you want to avoid having delay you need to set set `simulated_delay=False` to both the launch files. Otherwise you will have a one directional delay in eaither of the two nodes.
+
+
+
+To run the interface in simulation ensure that you are running the PX4 SITL simulation with `pop` namespace. The remaining steps will be the same.
+
+
+
+
+
+
+
+
