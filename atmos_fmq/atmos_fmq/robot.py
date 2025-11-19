@@ -160,7 +160,7 @@ class ControlFeeder(Node):
         for ns in self.namespaces:
             cur_time = self.get_clock().now()
 
-            if self.angular_velocity_on[ns] and self.attitude_on[ns] and self.local_position_on[ns] and self.control_on[ns]:
+            if self.angular_velocity_on[ns] and self.attitude_on[ns] and self.local_position_on[ns] :
 
                 msg_robot                          = RobotStateResponse()
                 msg_robot.robot_name               = ns

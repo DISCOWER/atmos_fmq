@@ -152,7 +152,7 @@ class SpacecraftModel:
         kxdot   = 4.02
         ky      = 1.0 # 0.47
         kydot   = 4.02
-        ktheta  = 0.2 # 0.08
+        ktheta  = 0.5 # 0.08
         kw      = 0.3 # 0.13
         dx      = x - x_ref
 
@@ -799,7 +799,7 @@ class MultiWrenchControl(Node):
                 self.get_logger().warning(f'No state message received yet for robot: {ns}. Sending zero control input.')
                 u, delta, x_average_pred, request_id = controller.zero_input_test_control()
 
-            self.get_logger().debug(f'Robot: {ns}, Control Input: Fx={u[FX]}, Fy={u[FY]}, Alpha={u[ALPHA]}, Delta={delta}')
+            self.get_logger().info(f'Robot: {ns}, Control Input: Fx={u[FX]}, Fy={u[FY]}, Alpha={u[ALPHA]}, Delta={delta}')
 
             pose_pred_msg                    = PoseStamped()
             pose_pred_msg.header.stamp       = current_time.to_msg()

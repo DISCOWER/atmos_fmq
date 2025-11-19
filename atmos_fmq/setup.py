@@ -26,6 +26,8 @@ setup(
             'publish_setpoints  = atmos_fmq.publish_setpoints:main',
             'docking            = atmos_fmq.docking:main',
             'delay_simulator    = atmos_fmq.delay_simulator:main',
+            'stable_setpoint    = atmos_fmq.stable_setpoint:main',
+            'circular_setpoint  = atmos_fmq.circular_setpoint:main',
         ],
     },
 )
